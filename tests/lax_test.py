@@ -5354,6 +5354,7 @@ class RaggedTest(jtu.JaxTestCase):
           lhs, rhs, group_sizes, ragged_dot_dimension_numbers=ragged_dnums,
           precision=jax.lax.Precision.DEFAULT,
           preferred_element_type=jnp.float32,
+          group_offset=None, out_sharding=None,
       )
     else:
       actual_shape = lax.ragged_dot_general(
@@ -5412,6 +5413,50 @@ class RaggedTest(jtu.JaxTestCase):
       self.assertArraysAllClose(
           batch_res[i, 0:upper_bound, :], ref_res, rtol=tol, atol=tol
       )
+
+  def test_ragged_dot_out_sharding(self):
+    mesh = jtu.create_mesh((1,), ("x",),
+                           axis_types=(jax.sharding.AxisType.Explicit,))
+    lhs = jnp.ones((16, 4), dtype=jnp.float32)
+    rhs = jnp.ones((2, 4, 3), dtype=jnp.float32)
+    group_sizes = jnp.array([8, 8], dtype=jnp.int32)
+
+    with jax.set_mesh(mesh):
+      out = lax.ragged_dot(lhs, rhs, group_sizes, out_sharding=jax.P())
+      self.assertEqual(out.shape, (16, 3))
+      self.assertEqual(out.sharding,
+                       jax.sharding.NamedSharding(mesh, jax.P(None, None)))
+
+      out = lax.ragged_dot(lhs, rhs, group_sizes,
+                           out_sharding=jax.P("x", None))
+      self.assertEqual(out.shape, (16, 3))
+      self.assertEqual(out.sharding,
+                       jax.sharding.NamedSharding(mesh, jax.P("x", None)))
+
+  def test_ragged_dot_general_out_sharding(self):
+    mesh = jtu.create_mesh((1,), ("x",),
+                           axis_types=(jax.sharding.AxisType.Explicit,))
+    lhs = jnp.ones((16, 4), dtype=jnp.float32)
+    rhs = jnp.ones((2, 4, 3), dtype=jnp.float32)
+    group_sizes = jnp.array([8, 8], dtype=jnp.int32)
+    ragged_dnums = lax.RaggedDotDimensionNumbers(
+        dot_dimension_numbers=(([1], [1]), ([], [])),
+        lhs_ragged_dimensions=[0],
+        rhs_group_dimensions=[0],
+    )
+
+    with jax.set_mesh(mesh):
+      out = lax.ragged_dot_general(lhs, rhs, group_sizes, ragged_dnums,
+                                    out_sharding=jax.P())
+      self.assertEqual(out.shape, (16, 3))
+      self.assertEqual(out.sharding,
+                       jax.sharding.NamedSharding(mesh, jax.P(None, None)))
+
+      out = lax.ragged_dot_general(lhs, rhs, group_sizes, ragged_dnums,
+                                    out_sharding=jax.P("x", None))
+      self.assertEqual(out.shape, (16, 3))
+      self.assertEqual(out.sharding,
+                       jax.sharding.NamedSharding(mesh, jax.P("x", None)))
 
 class LaxUtilsTest(jtu.JaxTestCase):
 

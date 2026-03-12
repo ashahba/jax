@@ -453,8 +453,12 @@ def _pallas_ragged_dot_general_impl(
                                           # precision parameter in the kernels.
     preferred_element_type: DTypeLike | None = None,
     group_offset: Array | None = None,
+    out_sharding=None,
 ) -> Array:
-
+  if out_sharding is not None:
+    raise NotImplementedError(
+      "Explicit sharding is not currently supported in the pallas-triton"
+      " lowering of ragged_dot_general. You can call this op under shard_map.")
 
   if group_offset is not None:
     raise NotImplementedError("group_offset is not currently supported in the "
