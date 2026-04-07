@@ -99,6 +99,9 @@ class Transform(Protocol):
   def pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
     return pp.text(f"{{{self}}}")
 
+class MultiRefTransform(Transform):
+  pass
+
 
 @tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -220,6 +223,38 @@ class TransposeTransform(Transform):
     return pp.text(f"{{transpose({list(self.permutation)})}}")
 
 
+@tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class SelectTransform(MultiRefTransform):
+  idx: Array | int = dataclasses.field(metadata=dict(static=False))
+  num_refs: int = dataclasses.field(metadata=dict(static=True))
+
+  def transform_type(self, x):
+    def _type(ref):
+      match ref:
+        case AbstractRef():
+          return ref
+        case core.ShapedArray():
+          raise NotImplementedError
+        case _:
+          raise TypeError(f"Cannot select {ref}")
+
+    assert (
+        isinstance(x, Sequence) and len(x) == self.num_refs
+    ), f"Select expected sequence of length {self.num_refs}, got {x}"
+    types = tuple(_type(ref) for ref in x)
+    if any(types[0] != t for t in types[1:]):
+      raise TypeError(f"Cannot select from Refs of different types: {types}")
+    return types[0]
+
+  def undo(self, x: core.AbstractValue) -> Transform:
+    raise NotImplementedError(type(self))
+
+  def pretty_print(self, context: core.JaxprPpContext) -> pp.Doc:
+    del context  # Unused.
+    return pp.text(f"{{select({self.idx=}, {self.num_refs=})}}")
+
+
 @dataclasses.dataclass
 class RefIndexer:
   """An object temporarily generated when doing ``ref.at``."""
@@ -230,7 +265,10 @@ class RefIndexer:
       slc = (slc,)
     from jax._src.state import indexing  # pyrefly: ignore[missing-import]
     indexer = indexing.NDIndexer.from_indices_shape(slc, self.ref_or_view.shape)
-    if isinstance(self.ref_or_view, TransformedRef):
+    if (
+        isinstance(self.ref_or_view, TransformedRef)
+        and not self.ref_or_view.multiref
+    ):
       view = self.ref_or_view
       return TransformedRef(view.ref, (*view.transforms, indexer))
     return TransformedRef(self.ref_or_view, (indexer,))
@@ -240,6 +278,22 @@ class RefIndexer:
 class TransformedRef:
   ref: Any
   transforms: tuple[Transform, ...]
+
+  def __post_init__(self):
+    if self.multiref and len(self.transforms) > 1:
+      raise ValueError(
+          f"Multi-ref TransformedRef requires a single transform: {self}"
+      )
+    if any(isinstance(t, MultiRefTransform) for t in self.transforms):
+      assert self.multiref and len(self.transforms) == 1
+
+  @property
+  def multiref(self) -> bool:
+    if isinstance(self.ref, Sequence):
+      if all(isinstance(x, int) for x in self.ref):
+        return False  # self.ref is an array's shape. This happens in lowering.
+      return True
+    return False
 
   @property
   def is_dynamic_size(self):
@@ -273,9 +327,13 @@ class TransformedRef:
 
   @property
   def at(self) -> RefIndexer:
+    if self.multiref:
+      raise NotImplementedError("At with multiref is not supported.")
     return RefIndexer(self)
 
   def bitcast(self, dtype):
+    if self.multiref:
+      raise NotImplementedError("Bitcast with multiref is not supported.")
     if self.is_dynamic_size:
       raise NotImplementedError(
           "Bitcast ref with dynamic size is not supported."
@@ -284,6 +342,8 @@ class TransformedRef:
     return TransformedRef(self.ref, (*self.transforms, BitcastTransform(dtype)))
 
   def reshape(self, *shape):
+    if self.multiref:
+      raise NotImplementedError("Reshape with multiref is not supported.")
     if self.is_dynamic_size:
       raise NotImplementedError(
           "Reshape ref with dynamic size is not supported."
@@ -295,6 +355,8 @@ class TransformedRef:
     return TransformedRef(self.ref, (*self.transforms, ReshapeTransform(shape)))
 
   def transpose(self, permutation: Sequence[int]):
+    if self.multiref:
+      raise NotImplementedError("Transpose with multiref is not supported.")
     transposer = TransposeTransform(tuple(permutation))
     return TransformedRef(self.ref, (*self.transforms, transposer))
 

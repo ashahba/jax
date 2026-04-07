@@ -71,7 +71,7 @@ from jax._src.pallas.mosaic import random as pl_random
 from jax._src.pallas.mosaic import tpu_info
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
-from jax._src.state.types import BitcastTransform, ReshapeTransform
+from jax._src.state.types import BitcastTransform, ReshapeTransform, SelectTransform
 from jax._src.typing import Array, DTypeLike
 from jax._src.util import foreach
 from jax._src.util import safe_map
@@ -112,6 +112,10 @@ zip, unsafe_zip = safe_zip, zip
 
 # Extended types that should not be converted to physical types in lowering.
 PHYSICAL_EXTENDED_DTYPES = {pallas_core.semaphore_dtype}
+
+_dma_unflatten = tpu_primitives._dma_unflatten
+_get_ref_and_transforms = tpu_primitives._get_ref_and_transforms
+_dma_tree_leaves = tpu_primitives._dma_tree_leaves
 
 
 # TODO(slebedev): Make this a TypeIs function, once we migrate to Pyrefly.
@@ -1647,7 +1651,16 @@ def _reshape_memref(
   )
 
 
-def _transform_ref(ref, ref_ty, ref_block_shape, transforms):
+def _transform_ref(ref, ref_ty, ref_block_shape, transforms=()):
+  # Unwrap the refs if they are TransformedRefs.
+  if transforms == () and isinstance(ref, state.TransformedRef):
+    ref, transforms = _get_ref_and_transforms(ref)
+  if isinstance(ref_ty, state.TransformedRef):
+    ref_ty, _ = _get_ref_and_transforms(ref_ty)
+  if isinstance(ref_block_shape, state.TransformedRef):
+    ref_block_shape, _ = _get_ref_and_transforms(ref_block_shape)
+  assert not isinstance(ref_ty, state.TransformedRef)
+  assert not isinstance(ref_block_shape, state.TransformedRef)
   for transform in transforms:
     match transform:
       case NDIndexer():
@@ -1661,6 +1674,11 @@ def _transform_ref(ref, ref_ty, ref_block_shape, transforms):
       case ReshapeTransform():
         ref, ref_block_shape = _reshape_memref(
             ref, transform, ref_ty, ref_block_shape
+        )
+      case SelectTransform():
+        raise NotImplementedError(
+            "_transform_ref() only supports single ref. Got:"
+            f" {ref = }, {ref_ty = }, {ref_block_shape = }, {transforms = }"
         )
       case _:
         raise NotImplementedError(f"Unsupported transform: {transform}")
@@ -4092,35 +4110,13 @@ def _dma_start_lowering_rule(
 ):
   if add:
     raise NotImplementedError("DMA with add=True is not supported.")
-  (
-      src_ref,
-      src_transforms,
-      dst_ref,
-      dst_transforms,
-      sem,
-      sem_transforms,
-      src_sem,
-      src_sem_transforms,
-      device_id,
-  ) = tree_util.tree_unflatten(tree, args)
-  (src_ref_aval, _, dst_ref_aval, _, sem_aval, _, src_sem_aval, _, device_id_aval) = (
-      tree_util.tree_unflatten(tree, ctx.avals_in)
+  src_ref, dst_ref, sem, src_sem, device_id = _dma_unflatten(tree, args)
+  src_ref_aval, dst_ref_aval, sem_aval, src_sem_aval, device_id_aval = (
+      _dma_unflatten(tree, ctx.avals_in)
   )
-  if src_ref_aval.dtype == jnp.bool_:
+  if any(r.dtype == jnp.bool_ for r in _dma_tree_leaves(src_ref_aval)):
     raise NotImplementedError("DMAs with bool dtypes are not supported.")
-  block_shapes = tree_util.tree_unflatten(tree, ctx.block_shapes)
-  src_ref_block_shape, dst_ref_block_shape = block_shapes[0], block_shapes[2]
-  src_ref, _ = _transform_ref(
-      src_ref, src_ref_aval, src_ref_block_shape, src_transforms
-  )
-  if src_sem is not None:
-    src_sem, _ = _transform_ref(
-        src_sem, src_sem_aval, src_sem_aval.shape, src_sem_transforms
-    )
-  dst_ref, _ = _transform_ref(
-      dst_ref, dst_ref_aval, dst_ref_block_shape, dst_transforms
-  )
-  sem, _ = _transform_ref(sem, sem_aval, sem_aval.shape, sem_transforms)
+  block_shapes = _dma_unflatten(tree, ctx.block_shapes)
   kernel_type = ctx.lowering_context.kernel_type
   if isinstance(sem_aval.memory_space, tpu_core.CoreMemorySpace):
     dest_kernel_type = sem_aval.memory_space.core_type
@@ -4136,40 +4132,35 @@ def _dma_start_lowering_rule(
           ctx, device_id, device_id_type, device_id_aval,
           dest_kernel_type=dest_kernel_type
       )
-  tpu.enqueue_dma(
-      src_ref,
-      dst_ref,
-      sem,
-      source_semaphore=src_sem,
-      device_id=device_id,
-      core_id=core_id,
-      priority=priority,
-  )
-  return []
+
+  def _dma_start(src_ref, dst_ref, sem, src_sem) -> list[ir.Value]:
+    tpu.enqueue_dma(
+        src_ref,
+        dst_ref,
+        sem,
+        source_semaphore=src_sem,
+        device_id=device_id,
+        core_id=core_id,
+        priority=priority,
+    )
+    return []
+
+  args = list(zip(
+      [src_ref, dst_ref, sem, src_sem],
+      [src_ref_aval, dst_ref_aval, sem_aval, src_sem_aval],
+      block_shapes[:4],
+  ))
+  return lower_transformed_refs(_dma_start, args)
 
 
 @register_lowering_rule(tpu_primitives.dma_wait_p)
 def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
                             device_id_type: primitives.DeviceIdType):
-  (
-      src,
-      src_transforms,
-      dst,
-      transforms,
-      sem,
-      sem_transforms,
-      _,
-      _,
-      device_id,
-  ) = tree_util.tree_unflatten(tree, args)
-  (src_aval, _, dst_aval, _, sem_aval, _, _, _, device_id_aval) = tree_util.tree_unflatten(
+  src, dst, sem, _, device_id = _dma_unflatten(tree, args)
+  src_aval, dst_aval, sem_aval, _, device_id_aval = _dma_unflatten(
       tree, ctx.avals_in
   )
-  block_shapes = tree_util.tree_unflatten(tree, ctx.block_shapes)
-  ref_block_shape = block_shapes[2]
-  src, _ = _transform_ref(src, src_aval, src_aval.shape, src_transforms)
-  dst, _ = _transform_ref(dst, dst_aval, ref_block_shape, transforms)
-  sem, _ = _transform_ref(sem, sem_aval, sem_aval.shape, sem_transforms)
+  block_shapes = _dma_unflatten(tree, ctx.block_shapes)
 
   core_id = None
   if device_id is not None:
@@ -4177,11 +4168,69 @@ def _dma_wait_lowering_rule(ctx: LoweringRuleContext, *args, tree,
         ctx, device_id, device_id_type, device_id_aval
     )
 
-  if ctx.forward_compatible or ctx.is_cloud_tpu_older_than(2025, 7, 27):
-    tpu.wait_dma2(sem, src, dst, core_id=core_id)
-  else:
-    tpu.wait_dma2(sem, src, dst, device_id=device_id, core_id=core_id)
-  return []
+  def _dma_wait(src_ref, dst_ref, sem) -> list[ir.Value]:
+    if ctx.forward_compatible or ctx.is_cloud_tpu_older_than(2025, 7, 27):
+      tpu.wait_dma2(sem, src_ref, dst_ref, core_id=core_id)
+    else:
+      tpu.wait_dma2(sem, src_ref, dst_ref, device_id=device_id, core_id=core_id)
+    return []
+
+  args = list(
+      zip([src, dst, sem], [src_aval, dst_aval, sem_aval], block_shapes[:3])
+  )
+  return lower_transformed_refs(_dma_wait, args)
+
+
+def lower_transformed_refs(f, refs):
+  """Lower f with args as potentially nested TransformedRefs."""
+  if refs == []:
+    return f()
+  (ref, ref_ty, ref_block_shape), *rest_refs = refs
+
+  if not isinstance(ref, state.TransformedRef) or not ref.multiref:
+    def new_f(*args):
+      if isinstance(ref, state.TransformedRef):
+        transformed_ref, _ = _transform_ref(ref, ref_ty, ref_block_shape)
+        return f(transformed_ref, *args)
+      return f(ref, *args)
+    return lower_transformed_refs(new_f, rest_refs)
+
+  match ref.transforms[0]:
+    case SelectTransform(idx=idx):
+      in_block_args = list(zip(ref.ref, ref_ty.ref, ref_block_shape.ref))
+      return _select_to_ifop(f, rest_refs, cast(Any, idx), in_block_args)
+    case _:
+      raise ValueError(f"Unsupported transform: {ref.transforms[0]}")
+
+
+def _select_to_ifop(f, rest_refs, idx, in_block_args):
+  # TODO(b/502722198): Use IndexSwitchOp instead of nested IfOp if it's fixed.
+  def _in_block(ref_i, ref_i_ty, ref_i_block_shape):
+    if not isinstance(ref_i, state.TransformedRef):
+      return lower_transformed_refs(partial(f, ref_i), rest_refs)
+    elif not ref_i.multiref:
+      new_f = lambda *args: f(
+          _transform_ref(ref_i, ref_i_ty, ref_i_block_shape)[0], *args
+      )
+      return lower_transformed_refs(new_f, rest_refs)
+    # TODO(ivyzheng): Compute non-leaf ty and block_shape to support this.
+    raise NotImplementedError("Nested multirefs are not supported.")
+
+  assert len(in_block_args) >= 2
+  pred = arith.cmpi(arith.CmpIPredicate.eq, idx, ir_constant(0, idx.type))
+  if_op = scf.IfOp(pred, [], has_else=True)
+  with ir.InsertionPoint(if_op.then_block):
+    out = _in_block(*in_block_args[0])
+    scf.yield_(out)
+  assert if_op.else_block is not None
+  with ir.InsertionPoint(if_op.else_block):
+    if len(in_block_args) > 2:
+      idx = arith.subi(idx, ir_constant(1, idx.type))
+      out = _select_to_ifop(f, rest_refs, idx, in_block_args[1:])
+    else:
+      out = _in_block(*in_block_args[1])
+    scf.yield_(out)
+  return if_op.results
 
 
 @register_lowering_rule(lax.axis_index_p, kernel_types=[*tpu_core.CoreType])
