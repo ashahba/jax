@@ -48,6 +48,19 @@ PARTITION: PartitioningPhase = ...
 
 ALL: PartitioningPhase = ...
 
+
+class CompatibilityRequirement(enum.Enum):
+  NONE = 0
+  WEEK_4 = 1
+  WEEK_12 = 2
+  MAX = 3
+
+
+def get_version_from_compatibility_requirement(
+    requirement: CompatibilityRequirement,
+) -> str: ...
+
+
 class SplitFragmentType(enum.Enum):
   KEEP_TRANSFERRED = 0
 

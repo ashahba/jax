@@ -49,6 +49,7 @@ limitations under the License.
 #include "shardy/dialect/mpmd/ir/fragment_execution_rules.h"
 #include "shardy/dialect/mpmd/ir/utils.h"
 #include "shardy/dialect/mpmd/transforms/import/mesh_assignment_map.h"
+#include "shardy/dialect/sdy/ir/dialect.h"
 #include "shardy/integrations/python/jax/mpmd/jaxlib/mpmd_program.h"
 #include "jaxlib/nb_class_ptr.h"
 #include "jaxlib/py_client.h"
@@ -258,6 +259,26 @@ NB_MODULE(_sdy_mpmd, m) {
       .value("KEEP_TRANSFERRED", SplitFragmentType::kKeepTransferred)
       .value("DROP_TRANSFERRED", SplitFragmentType::kDropTransferred)
       .export_values();
+
+  nb::enum_<mlir::sdy::SdyDialectVersion::CompatibilityRequirement>(
+      m, "CompatibilityRequirement")
+      .value("NONE",
+             mlir::sdy::SdyDialectVersion::CompatibilityRequirement::NONE)
+      .value("WEEK_4",
+             mlir::sdy::SdyDialectVersion::CompatibilityRequirement::WEEK_4)
+      .value("WEEK_12",
+             mlir::sdy::SdyDialectVersion::CompatibilityRequirement::WEEK_12)
+      .value("MAX",
+             mlir::sdy::SdyDialectVersion::CompatibilityRequirement::MAX);
+
+  m.def(
+      "get_version_from_compatibility_requirement",
+      [](mlir::sdy::SdyDialectVersion::CompatibilityRequirement requirement) {
+        return mlir::sdy::SdyDialectVersion::fromCompatibilityRequirement(
+                   requirement)
+            .toString();
+      },
+      nb::arg("requirement"));
 
   nb::class_<FragmentOrigin>(m, "FragmentOrigin")
       .def(nb::init<const std::string&, int>(), nb::arg("computation_name"),
