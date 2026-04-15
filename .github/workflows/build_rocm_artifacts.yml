@@ -108,7 +108,7 @@ jobs:
     outputs:
       s3_upload_uri: ${{ steps.store-s3-upload-uri.outputs.s3_upload_uri }}
     container:
-      image: "ghcr.io/rocm/jax-manylinux_2_28-rocm-7.2.0:latest"
+      image: "ghcr.io/rocm/jax-manylinux_2_28-rocm-7.2.0:@sha256:88a397a3c85416e8ceb638615a9807a09c549824"
       volumes:
         - /data:/data
       options: >-
