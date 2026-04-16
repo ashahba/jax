@@ -36,7 +36,7 @@ from jax._src.pallas.mosaic import core as tpu_core
 from jax._src.state import discharge as state_discharge
 from jax._src.state import indexing
 from jax._src.state import primitives as sp
-from jax._src.state.types import Transform
+from jax._src.state.types import Transform, transform_type
 from jax._src.typing import DTypeLike
 import jax.numpy as jnp
 
@@ -419,6 +419,65 @@ def _dma_start_to_lojax(*args, tree, device_id_type, priority, add):
   return []
 dma_start_p.to_lojax = _dma_start_to_lojax
 
+
+def _validate_dma_args(
+    src_ref_aval,
+    src_transforms_avals,
+    dst_ref_aval,
+    dst_transforms_avals,
+    dst_sem_aval,
+    dst_sem_transforms_avals,
+    src_sem_aval,
+    src_sem_transforms_avals,
+):
+  if not all(
+      isinstance(x, state.AbstractRef)
+      for x in [src_ref_aval, dst_ref_aval, dst_sem_aval]
+  ):
+    raise ValueError("DMA source/destination/semaphore arguments must be Refs.")
+
+  dst_sem_final_aval = transform_type(dst_sem_transforms_avals, dst_sem_aval)
+  assert isinstance(dst_sem_final_aval, state.AbstractRef)
+  if dst_sem_final_aval.shape:
+    raise ValueError(
+        "Cannot use a non-()-shaped destination semaphore:"
+        f" {dst_sem_final_aval.shape}"
+    )
+  if src_sem_aval is not None:
+    if not isinstance(src_sem_aval, state.AbstractRef):
+      raise ValueError("Expected the source semaphore to be a reference")
+    src_sem_final_aval = transform_type(src_sem_transforms_avals, src_sem_aval)
+    assert isinstance(src_sem_final_aval, state.AbstractRef)
+    if src_sem_final_aval.shape:
+      raise ValueError(
+          "Cannot use a non-()-shaped source semaphore:"
+          f" {src_sem_final_aval.shape}"
+      )
+
+  src_final_aval = transform_type(src_transforms_avals, src_ref_aval)
+  dst_final_aval = transform_type(dst_transforms_avals, dst_ref_aval)
+  assert isinstance(src_final_aval, state.AbstractRef)
+  assert isinstance(dst_final_aval, state.AbstractRef)
+
+  if src_final_aval.dtype != dst_final_aval.dtype:
+    raise ValueError(
+        "DMA source and destination must have the same dtype, "
+        f"but got {src_final_aval.dtype} and {dst_final_aval.dtype}."
+    )
+
+  def _is_dynamic(shape):
+    return any(not isinstance(d, int) for d in shape)
+
+  if not _is_dynamic(src_final_aval.shape) and not _is_dynamic(
+      dst_final_aval.shape
+  ):
+    if src_final_aval.shape != dst_final_aval.shape:
+      raise ValueError(
+          "DMA source and destination must have the same shape, "
+          f"but got {src_final_aval.shape} and {dst_final_aval.shape}."
+      )
+
+
 @dma_start_p.def_effectful_abstract_eval
 def _dma_start_abstract_eval(*args, tree, device_id_type, priority, add):
   if priority < 0:
@@ -434,28 +493,18 @@ def _dma_start_abstract_eval(*args, tree, device_id_type, priority, add):
       src_sem_transforms_avals,
       device_id_aval,
   ) = _dma_unflatten(tree, args)
-  if not all(isinstance(x, state.AbstractRef) for x in [
-      src_ref_aval, dst_ref_aval, dst_sem_aval]):
-    raise ValueError(
-        "DMA source/destination/semaphore arguments must be Refs.")
-  dst_sem_shape = dst_sem_aval.shape
-  if dst_sem_transforms_avals:
-    dst_sem_shape = dst_sem_transforms_avals[-1].get_indexer_shape()
-  if dst_sem_shape:
-    raise ValueError(
-        f"Cannot signal on a non-()-shaped semaphore: {dst_sem_shape}"
-    )
-  if src_sem_aval is not None:
-    if not isinstance(src_sem_aval, state.AbstractRef):
-      raise ValueError(
-          "DMA source semaphore must be a Ref.")
-    src_sem_shape = src_sem_aval.shape
-    if src_sem_transforms_avals:
-      src_sem_shape = src_sem_transforms_avals[-1].get_indexer_shape()
-    if src_sem_shape:
-      raise ValueError(
-          f"Cannot signal on a non-()-shaped semaphore: {src_sem_shape}"
-      )
+
+  _validate_dma_args(
+      src_ref_aval,
+      src_transforms_avals,
+      dst_ref_aval,
+      dst_transforms_avals,
+      dst_sem_aval,
+      dst_sem_transforms_avals,
+      src_sem_aval,
+      src_sem_transforms_avals,
+  )
+
   return [], _get_dma_effects(
       src_transforms_avals,
       dst_transforms_avals,
@@ -464,6 +513,7 @@ def _dma_start_abstract_eval(*args, tree, device_id_type, priority, add):
       device_id_aval,
       device_id_type,
   )
+
 
 def _dma_start_pp_eqn(eqn: jax_core.JaxprEqn,
                       context: jax_core.JaxprPpContext,
@@ -737,8 +787,7 @@ def _dma_wait_abstract_eval(*args, tree, device_id_type):
       src_sem_transforms_avals,
       device_id_aval,
   ) = _dma_unflatten(tree, args)
-  if not isinstance(dst_sem_aval, state.AbstractRef):
-    raise ValueError("Expected the destination semaphore to be a reference")
+
   allowed_semaphore_types = {
       tpu_core.dma_semaphore,
       pl_core.SEMAPHORE_INTERPRET_DTYPE,
@@ -750,6 +799,18 @@ def _dma_wait_abstract_eval(*args, tree, device_id_type):
         "dma_wait requires a DMA semaphore, but got a regular semaphore."
         " Use pl.semaphore_wait() instead."
     )
+
+  _validate_dma_args(
+      src_ref_aval,
+      src_transforms_avals,
+      dst_ref_aval,
+      dst_transforms_avals,
+      dst_sem_aval,
+      dst_sem_transforms_avals,
+      src_sem_aval,
+      src_sem_transforms_avals,
+  )
+
   return [], _get_dma_effects(
       src_transforms_avals,
       dst_transforms_avals,

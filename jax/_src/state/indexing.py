@@ -277,10 +277,11 @@ class NDIndexer(state_types.Transform):
         return x.update(inner_aval=self.transform_type(x.inner_aval))
       case core.ShapedArray():
         self._validate_sharding(x.sharding)
-        if self.is_dynamic_size:
-          return DShapedArray(self.get_indexer_shape(), x.dtype,
+        indexer_shape = self.get_indexer_shape()
+        if self.is_dynamic_size or any(not isinstance(d, int) for d in indexer_shape):
+          return DShapedArray(indexer_shape, x.dtype,
                               weak_type=x.weak_type)
-        return x.update(shape=self.get_indexer_shape())
+        return x.update(shape=indexer_shape)
       case _:
         if type(x) in indexer_transform_type_registry:
           assert hasattr(x, "transform_ndindexer")
@@ -334,7 +335,7 @@ class NDIndexer(state_types.Transform):
     return pp.concat([pp.text("["), pp.text(",".join(indices)), pp.text("]")])
 
 
-class DShapedArray:
+class DShapedArray(core.ShapedArray):
   def __init__(self, shape, dtype, weak_type=False):
     self.shape = shape
     self.dtype = core._dtype_object(dtype)
@@ -344,7 +345,7 @@ class DShapedArray:
   def raise_val(self, val): return val
   def lo_ty(self): return [self]
 
-  def update(self, shape=None, dtype=None, weak_type=None):
+  def update(self, shape=None, dtype=None, weak_type=None):  # pyrefly: ignore[bad-override]
     if shape is None:
       shape = self.shape
     if dtype is None:
@@ -382,7 +383,7 @@ class DShapedArray:
     wt_str = "~" if self.weak_type else ""
     return f'{wt_str}{self.str_short()}'
 
-  def str_short(self):
+  def str_short(self, *_):  # pyrefly: ignore[bad-override]
     return (f"DShapedArray(shape={self.shape}, dtype={self.dtype},"
             f" weak_type={self.weak_type})")
 
