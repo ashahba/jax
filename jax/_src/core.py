@@ -1962,7 +1962,7 @@ def cur_qdd(x):
   prev_trace = trace_ctx.trace
   trace_ctx.set_trace(eval_trace)
   try:
-    return prev_trace.cur_qdd(x)  # pyrefly: ignore[missing-attribute]
+    return prev_trace.cur_qdd(x)
   finally:
     trace_ctx.set_trace(prev_trace)
 
@@ -3230,7 +3230,7 @@ closed_call_p.def_effectful_abstract_eval(
 def mapped_aval(size: AxisSize, axis, aval: AbstractValue) -> AbstractValue:
   from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
   if isinstance(aval, HiType):
-    return aval.dec_rank(size, axis)  # pyrefly: ignore[bad-argument-type]
+    return aval.dec_rank(size, axis)
   handler, _ = aval_mapping_handlers.get(type(aval), (None, None))
   if handler is not None:
     return handler(size, axis, aval)
@@ -3245,7 +3245,7 @@ def unmapped_aval(size: AxisSize, axis: int | None,
                   aval: AbstractValue, explicit_mesh_axis=None) -> AbstractValue:
   from jax._src.hijax import HiType  # pyrefly: ignore[missing-import]
   if isinstance(aval, HiType):
-    return aval.inc_rank(size, axis)  # pyrefly: ignore[bad-argument-type]
+    return aval.inc_rank(size, axis)
   _, handler = aval_mapping_handlers.get(type(aval), (None, None))
   if handler is not None:
     return handler(size, axis, explicit_mesh_axis, aval)

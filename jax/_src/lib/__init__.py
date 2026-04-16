@@ -148,7 +148,7 @@ if hasattr(mosaic_gpu_dialect, 'init_cc_mlir'):
   try:
     from jaxlib.mlir import ir  # pyrefly: ignore[missing-module-attribute]
   except ImportError:
-    from mlir import ir  # pyrefly: ignore[missing-import]
+    from mlir import ir
   mosaic_gpu_dialect.init_cc_mlir(ir)
 
 import jaxlib.mosaic.python.tpu as tpu  # noqa: F401

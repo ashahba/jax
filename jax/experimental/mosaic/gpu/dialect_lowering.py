@@ -353,7 +353,7 @@ def _arith_constant_op_lowering_rule(
           fa.FragmentedArray.splat(
               arith.constant(ty.element_type, value.get_splat_value()),
               tuple(ty.shape),
-              layouts_lib.from_layout_attr(op.attributes["out_layouts"][0]),  # pyrefly: ignore[bad-index]
+              layouts_lib.from_layout_attr(op.attributes["out_layouts"][0]),
               is_signed=is_signed,
           ),
           op.result.type,
@@ -1067,7 +1067,7 @@ def _mgpu_async_load_op_lowering_rule(
     utils.warpgroup_barrier()  # Make sure the writes have completed.
 
   # TODO(dasenov): Add support for the remaining op properties.
-  oob_mode = lc.OOBFillMode(ir.IntegerAttr(load_op.oob_fill_mode).value)  # pyrefly: ignore[missing-attribute]
+  oob_mode = lc.OOBFillMode(ir.IntegerAttr(load_op.oob_fill_mode).value)
   ctx.launch_context.async_copy(
       src_ref=load_op.source,
       dst_ref=unwrapped_dst,
@@ -1421,7 +1421,6 @@ def _cmpi_op_lowering_rule(
   [layout] = inference_utils.out_layouts(op)
   if any(in_layout != layout for in_layout in in_layouts):
     raise ValueError("Layout mismatch")
-  # pyrefly: ignore[missing-attribute]
   impl, is_signed = CMPI_IMPLS[op.predicate.value]
   lhs = _fragmented_array_from_ir(op.lhs, layout, is_signed)
   rhs = _fragmented_array_from_ir(op.rhs, layout, is_signed)
@@ -1446,7 +1445,6 @@ def _cmpf_op_lowering_rule(
   [layout] = inference_utils.out_layouts(op)
   if any(in_layout != layout for in_layout in in_layouts):
     raise ValueError("Layout mismatch")
-  # pyrefly: ignore[missing-attribute]
   impl = CMPF_IMPLS[op.predicate.value]
   lhs = _fragmented_array_from_ir(op.lhs, layout)
   rhs = _fragmented_array_from_ir(op.rhs, layout)
@@ -1630,7 +1628,7 @@ def _mgpu_slice_smem_op_lowering_rule(
     ctx: LoweringContext, op: mgpu.SliceSMEMOp
 ) -> Sequence[ir.Value]:
   ref_ty = ir.MemRefType(op.result.type)
-  offset = op.offset.value  # pyrefly: ignore[missing-attribute]
+  offset = op.offset.value
   if isinstance(ref_ty.element_type, mgpu.BarrierType):
     # Barrier memrefs are not transformed and must not be wrapped.
     assert not inference_utils.has_out_transforms_set(op)

@@ -269,7 +269,7 @@ def lower_pipelined_jaxpr_into_module(
     )
     pipeline.emit_pipeline(
         body_fn,
-        grid=sequential_grid,  # pyrefly: ignore[bad-argument-type]
+        grid=sequential_grid,
         in_specs=map(make_block_spec, in_block_mappings),
         out_specs=map(make_block_spec, out_block_mappings),
         tiling=tiling,

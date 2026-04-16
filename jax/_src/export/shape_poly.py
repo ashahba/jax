@@ -211,7 +211,7 @@ class _DimFactor:
     return self._syntactic_cmp(other) >= 0
 
   def evaluate(self, env: DimVarEnv, scope: SymbolicScope):
-    from jax._src.lax import lax  # pyrefly: ignore[missing-import]
+    from jax._src.lax import lax
 
     if self.var is not None:
       try:
@@ -1803,7 +1803,7 @@ class ShapeConstraint:
     resolved statically, returns a value representing if the
     constraint is satisfied.
     """
-    from jax._src.lax import lax  # pyrefly: ignore[missing-import]
+    from jax._src.lax import lax
 
     left, right = eval.evaluate(self.left), eval.evaluate(self.right)
     # Try to evaluate the constraint statically.
