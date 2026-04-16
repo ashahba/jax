@@ -69,13 +69,6 @@ class VariableType(enum.IntEnum):
   ARGUMENT = 2
 
 
-class MemorySpace(enum.Enum):
-  """The memory space of a variable."""
-  REG = enum.auto()
-  SMEM = enum.auto()
-  TMEM = enum.auto()
-
-
 _op_name_regex = re.compile(r"^(%\d+ = )?\S+")
 
 
@@ -117,16 +110,16 @@ class ValueSite:
     return tuple(self.value.type.shape)
 
   @property
-  def memory_space(self) -> MemorySpace:
+  def memory_space(self) -> cs.MemorySpace:
     """Returns the memory space associated with this value."""
     ty = self.value.type
     if isinstance(ty, ir.VectorType):
-      return MemorySpace.REG
+      return cs.MemorySpace.REG
     assert isinstance(ty, ir.MemRefType)
     if utils.is_tmem_ref(ty):
-      return MemorySpace.TMEM
+      return cs.MemorySpace.TMEM
     elif utils.is_smem_ref(ty):
-      return MemorySpace.SMEM
+      return cs.MemorySpace.SMEM
     raise ValueError(f"Unsupported memory space for: {ty}")
 
   def __str__(self):
@@ -140,6 +133,21 @@ class ValueSite:
       return f"{match.group(0)}:a-{self.index}"
 
 
+@dataclasses.dataclass(frozen=True)
+class Variable(cs.Variable):
+  """A concrete subclass of `cs.Variable`."""
+
+  key: ValueSite
+
+  @property
+  def shape(self) -> tuple[int, ...]:
+    return self.key.shape
+
+  @property
+  def memory_space(self) -> cs.MemorySpace:
+    return self.key.memory_space
+
+
 def is_hopper(arch: tuple[int, int]) -> bool:
   return arch == (9, 0)
 
@@ -151,10 +159,10 @@ def extract_assignment_candidates_from_reduce_equation(
     keep_dims: bool,
 ) -> Iterator[cs.RegisterLayout]:
   """Yields layout candidates for the reduce equation `small = reduce(large, reduction_dims)."""
-  large_shape = large.key.shape
+  large_shape = large.shape
 
   if isinstance(small.value, fa.WGSplatFragLayout):
-    yield cs.RegisterLayout(fa.WGSplatFragLayout(large_shape))
+    yield cs.RegisterLayout(fa.WGSplatFragLayout(large.shape))
     return
 
   if isinstance(small.value, fa.WGStridedFragLayout):
@@ -202,8 +210,6 @@ def _strided_layout_for_variable(
 
   If the given variable cannot have a strided layout, returns `None`.
   """
-  # TODO(bchetioui): should we make variables carry a shape as well, to make
-  # things easier?
   ty = variable.key.value.type
   assert isinstance(ty, ir.VectorType)
   return fa.WGStridedFragLayout.from_shaped_type(ty)
@@ -332,8 +338,8 @@ def _extract_layout_candidates_from_smem_registers_transfer(
   assert isinstance(variable, cs.Variable)  # Satisfy type checkers.
   if isinstance(constant, cs.RegisterLayout):
     layout = constant.value
-    assert variable.key.memory_space == MemorySpace.SMEM
-    if isinstance(layout, fa.TiledLayout) and len(variable.key.shape) >= 2:
+    assert variable.memory_space == cs.MemorySpace.SMEM
+    if isinstance(layout, fa.TiledLayout) and len(variable.shape) >= 2:
       # Maintain a set of yielded tilings to avoid duplicates caused by existing
       # divides constraints.
       yielded = set()
@@ -351,7 +357,7 @@ def _extract_layout_candidates_from_smem_registers_transfer(
     return
 
   assert isinstance(constant, cs.SMEMTiling)
-  assert variable.key.memory_space == MemorySpace.REG
+  assert variable.memory_space == cs.MemorySpace.REG
   for layout in _register_layouts_for_optimized_transfer_to_smem(
       variable.key.value.type, constant, arch
   ):
@@ -373,7 +379,7 @@ def _extract_layout_candidates_from_mma_tiling(
     case _:
       return
 
-  tiled_dimensions = v.key.shape[-2:]
+  tiled_dimensions = v.shape[-2:]
   # TODO(bchetioui): we can conjure additional tilings here if
   # `allow_unswizzled` is true, but it is not clear which ones yet.
   for swizzle in (128, 64, 32):
@@ -450,7 +456,9 @@ def conjure_assignment(
       constraint_system.constraints, arch
   ):
     match constant:
-      case cs.RegisterLayout(value=value) if not isinstance(value, fa.TiledLayout):
+      case cs.RegisterLayout(value=value) if not isinstance(
+          value, fa.TiledLayout
+      ):
         low_priority_assignments.append((variable, constant))
       case _:
         yield variable, constant
@@ -469,19 +477,19 @@ def conjure_assignment(
       continue
     # Try to instantiate a single variable to a default layout and see if it
     # reduces the system.
-    match variable.key.memory_space:
-      case MemorySpace.REG:
+    match variable.memory_space:
+      case cs.MemorySpace.REG:
         layout = _strided_layout_for_variable(variable)
         if layout is not None:
           yield variable, cs.RegisterLayout(layout)
-      case MemorySpace.SMEM:
+      case cs.MemorySpace.SMEM:
         yield variable, cs.SMEMTiling(None)
-      case MemorySpace.TMEM:
+      case cs.MemorySpace.TMEM:
         layout = _default_tmem_layout_for_variable(variable)
         if layout is not None:
           yield variable, cs.TMEMLayout(layout)
       case _:
-        raise ValueError(f"Unsupported memory space: {variable.key.memory_space}")
+        raise ValueError(f"Unsupported memory space: {variable.memory_space}")
 
 
 def find_assignments_for(
@@ -542,7 +550,7 @@ def find_assignments_for(
       )
     variable, expr = assignment
     assert isinstance(expr, cs.Constant)
-    if not is_valid_assignment(variable.key.shape, expr):
+    if not is_valid_assignment(variable.shape, expr):
       continue
     # Trying one valid assignment consumes fuel.
     fuel -= 1
@@ -667,7 +675,7 @@ def _pointwise_op_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   all_value_sites = vector_value_sites(op)
-  variable = cs.Variable(all_value_sites[-1])
+  variable = Variable(all_value_sites[-1])
   return cs.ConstraintSystem(), {variable: all_value_sites}
 
 
@@ -729,8 +737,8 @@ def _vector_load_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   # Registers
   dest = ValueSite(op, VariableType.RESULT, 0)
-  dest_var = cs.Variable(dest)
-  value_sites_for_variable = {dest_var: [dest]}
+  dest_var = Variable(dest)
+  value_sites_for_variable: ValueSitesForVariable = {dest_var: [dest]}
   constraints: list[cs.Constraint]
   constraints = [cs.NotOfType(dest_var, fa.WGSplatFragLayout)]
 
@@ -767,7 +775,7 @@ if hasattr(mgpu, "MultimemLoadReduceOp"):
       op: mgpu.MultimemLoadReduceOp,
   ) -> ConstraintSystemDerivationRuleResult:
     dest = ValueSite(op, VariableType.RESULT, 0)
-    dest_var = cs.Variable(dest)
+    dest_var = Variable(dest)
     system = cs.ConstraintSystem(
         constraints=[cs.NotOfType(dest_var, fa.WGSplatFragLayout)]
     )
@@ -781,8 +789,8 @@ def _vector_store_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   # Registers
   value = ValueSite(op, VariableType.OPERAND, 0)
-  value_var = cs.Variable(value)
-  value_sites_for_variable = {value_var: [value]}
+  value_var = Variable(value)
+  value_sites_for_variable: ValueSitesForVariable = {value_var: [value]}
 
   # Store is a special case in Pallas, where we are willing to downgrade from
   # requiring an optimized transfer in some cases.
@@ -821,7 +829,7 @@ def _debug_print_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   value = ValueSite(op, VariableType.OPERAND, 0)
-  return cs.ConstraintSystem(), {cs.Variable(value): [value]}
+  return cs.ConstraintSystem(), {Variable(value): [value]}
 
 
 @_add_constraint_system_derivation_rule(mgpu.PrintLayoutOp)
@@ -830,7 +838,7 @@ def _print_layout_constraint_system(
     op: mgpu.PrintLayoutOp,
 ) -> ConstraintSystemDerivationRuleResult:
   value = ValueSite(op, VariableType.OPERAND, 0)
-  var = cs.Variable(value) if is_vector(op.value) else ctx.producer_ref(value)
+  var = Variable(value) if is_vector(op.value) else ctx.producer_ref(value)
   return cs.ConstraintSystem(), {var: [value]}
 
 
@@ -841,7 +849,7 @@ def _broadcasted_iota_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   value = ValueSite(op, VariableType.RESULT, 0)
-  var = cs.Variable(value)
+  var = Variable(value)
   constraints = [cs.NotOfType(var, fa.WGSplatFragLayout)]
   return cs.ConstraintSystem(constraints=constraints), {var: [value]}
 
@@ -857,7 +865,7 @@ def _optimization_barrier_constraint_system(
   for i, operand in enumerate(op.operands):
     if not is_vector(operand):
       continue
-    variable = cs.Variable(ValueSite(op, VariableType.OPERAND, i))
+    variable = Variable(ValueSite(op, VariableType.OPERAND, i))
     value_sites_for_variable[variable] = [
         ValueSite(op, VariableType.OPERAND, i),
         ValueSite(op, VariableType.RESULT, i)
@@ -874,7 +882,7 @@ def _constant_constraint_system(
   del ctx
   value = constant_op.value
   result = ValueSite(constant_op, VariableType.RESULT, 0)
-  variable = cs.Variable(result)
+  variable = Variable(result)
   shape = tuple(ir.ShapedType(constant_op.result.type).shape)
   if (
       isinstance(value, ir.DenseElementsAttr)
@@ -926,7 +934,7 @@ def _for_constraint_system(
     yield_operand = ValueSite(
         yield_op, VariableType.OPERAND, result_index
     )
-    var = cs.Variable(operand) if is_vector(o) else ctx.producer_ref(operand)
+    var = Variable(operand) if is_vector(o) else ctx.producer_ref(operand)
     value_sites_for_variable[var] = [operand, arg, result, yield_operand]
 
   return cs.ConstraintSystem(), value_sites_for_variable
@@ -993,7 +1001,7 @@ def _while_constraint_system(
       case VariableType.OPERAND:
         arg = ValueSite(op, VariableType.ARGUMENT, idx, region_index=0)
         yield_operand = ValueSite(yield_op, VariableType.OPERAND, idx)
-        value_sites_for_variable[cs.Variable(value_site)] = [
+        value_sites_for_variable[Variable(value_site)] = [
             value_site,
             arg,
             yield_operand,
@@ -1002,7 +1010,7 @@ def _while_constraint_system(
         # Increment by 1 to account for the conditional.
         cond_operand = ValueSite(cond_op, VariableType.OPERAND, idx + 1)
         arg = ValueSite(op, VariableType.ARGUMENT, idx, region_index=1)
-        value_sites_for_variable[cs.Variable(value_site)] = [
+        value_sites_for_variable[Variable(value_site)] = [
             value_site,
             arg,
             cond_operand,
@@ -1020,17 +1028,15 @@ def _index_switch_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   value_sites_for_variable: ValueSitesForVariable = {
-      cs.Variable(o): [o] for o in vector_value_sites(op)
+      Variable(o): [o] for o in vector_value_sites(op)
   }
   for region in op.regions:
     [block] = region.blocks
     yield_op = _terminator(block, scf.YieldOp)
-    for value_site in value_sites_for_variable.keys():
-      assert value_site.key.type == VariableType.RESULT
-      yield_operand = ValueSite(
-          yield_op, VariableType.OPERAND, value_site.key.index
-      )
-      value_sites_for_variable[value_site].append(yield_operand)
+    for var in value_sites_for_variable.keys():
+      assert var.key.type == VariableType.RESULT
+      yield_operand = ValueSite(yield_op, VariableType.OPERAND, var.key.index)
+      value_sites_for_variable[var].append(yield_operand)
 
   return cs.ConstraintSystem(), value_sites_for_variable
 
@@ -1042,9 +1048,9 @@ def _layout_cast_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   operand = ValueSite(op, VariableType.OPERAND, 0)
-  operand_var = cs.Variable(operand)
+  operand_var = Variable(operand)
   result = ValueSite(op, VariableType.RESULT, 0)
-  result_var = cs.Variable(result)
+  result_var = Variable(result)
   out_layout = layouts_lib.from_layout_attr(op.new_layout)
   if not is_valid_register_layout_assignment(operand.shape, out_layout):
     raise ValueError(
@@ -1073,7 +1079,7 @@ def _wgmma_constraint_system(
 
   acc_out = ValueSite(op, VariableType.RESULT, 0)
   acc_in = ValueSite(op, VariableType.OPERAND, 0)
-  acc_var = cs.Variable(acc_out)
+  acc_var = Variable(acc_out)
   acc_layout = fa.WGMMA_LAYOUT
   assignments[acc_var] = cs.RegisterLayout(acc_layout)
   if not is_valid_register_layout_assignment(acc_out.shape, acc_layout):
@@ -1108,7 +1114,7 @@ def _wgmma_constraint_system(
     else:
       constraints.append(cs.Equals(lhs=a_var, rhs=b_var))
   else:
-    a_var = cs.Variable(a)
+    a_var = Variable(a)
     if utils.bitwidth(op.a.type.element_type) == 8:
       layout = fa.WGMMA_LAYOUT_8BIT
     else:
@@ -1134,7 +1140,7 @@ def _vector_broadcast_constraint_system(
   # mgpu.BroadcastInDimOp instead when dealing with broadcasting vectors.
   if isinstance(op.source.type, ir.ShapedType):
     raise NotImplementedError("Only vector broadcasts from scalars are supported.")
-  out_variable = cs.Variable(ValueSite(op, VariableType.RESULT, 0))
+  out_variable = Variable(ValueSite(op, VariableType.RESULT, 0))
   layout = cs.RegisterLayout(fa.WGSplatFragLayout(tuple(op.result.type.shape)))
   return (
       cs.ConstraintSystem(assignments={out_variable: layout}),
@@ -1148,7 +1154,7 @@ def _vector_reduction_constraint_system(
     op: vector.ReductionOp,
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
-  in_variable = cs.Variable(ValueSite(op, VariableType.OPERAND, 0))
+  in_variable = Variable(ValueSite(op, VariableType.OPERAND, 0))
   return cs.ConstraintSystem(), {in_variable: [in_variable.key]}
 
 
@@ -1161,8 +1167,8 @@ def _multi_dim_reduction_constraint_system(
   source = ValueSite(op, VariableType.OPERAND, 0)
   acc = ValueSite(op, VariableType.OPERAND, 1)
   out = ValueSite(op, VariableType.RESULT, 0)
-  source_variable = cs.Variable(source)
-  out_variable = cs.Variable(out)
+  source_variable = Variable(source)
+  out_variable = Variable(out)
   constraints = [
       cs.NotOfType(source_variable, fa.WGStridedFragLayout),
       cs.Equals(
@@ -1184,8 +1190,8 @@ def _broadcast_in_dim_constraint_system(
     op: mgpu.BroadcastInDimOp,
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
-  src_variable = cs.Variable(ValueSite(op, VariableType.OPERAND, 0))
-  dst_variable = cs.Variable(ValueSite(op, VariableType.RESULT, 0))
+  src_variable = Variable(ValueSite(op, VariableType.OPERAND, 0))
+  dst_variable = Variable(ValueSite(op, VariableType.RESULT, 0))
   src_shape = tuple(op.operand.type.shape)
   dst_shape = tuple(op.result.type.shape)
 
@@ -1249,8 +1255,8 @@ def _shape_cast_constraint_system(
   in_shape = tuple(cast(ir.ShapedType, op.source.type).shape)
   out_shape = tuple(cast(ir.ShapedType, op.result.type).shape)
 
-  in_variable = cs.Variable(ValueSite(op, VariableType.OPERAND, 0))
-  out_variable = cs.Variable(ValueSite(op, VariableType.RESULT, 0))
+  in_variable = Variable(ValueSite(op, VariableType.OPERAND, 0))
+  out_variable = Variable(ValueSite(op, VariableType.RESULT, 0))
 
   # Here, we are in a case where we are stating
   #
@@ -1291,22 +1297,20 @@ def _extract_strided_slice_constraint_system(
   del ctx
   if any(ir.IntegerAttr(s).value != 1 for s in op.strides):
     raise NotImplementedError("`strides` must contain only 1s.")
-  operand = ValueSite(op, VariableType.OPERAND, 0)
-  result = ValueSite(op, VariableType.RESULT, 0)
-  variable = cs.Variable(operand)
-  offsets: tuple[int, ...] = tuple(ir.IntegerAttr(o).value for o in op.offsets)
+  operand = Variable(ValueSite(op, VariableType.OPERAND, 0))
+  result = Variable(ValueSite(op, VariableType.RESULT, 0))
+  offsets = tuple(ir.IntegerAttr(o).value for o in op.offsets)
   constraints = [
-      cs.Divides(variable, offsets),
+      cs.Divides(operand, offsets),
+      cs.Equals(operand, result),
       # TODO(allanrenucci): Remove once vectors with splat and strided layouts
       # can be sliced.
-      cs.NotOfType(variable, fa.WGSplatFragLayout),
-      cs.NotOfType(variable, fa.WGStridedFragLayout),
+      cs.NotOfType(result, fa.WGSplatFragLayout),
+      cs.NotOfType(result, fa.WGStridedFragLayout),
   ]
   return (
       cs.ConstraintSystem(constraints=constraints),
-      # We use a single variable because lowering does not support two different
-      # layouts for `source` and `result`.
-      {variable: [operand, result]},
+      {operand: [operand.key], result: [result.key]},
   )
 
 
@@ -1315,31 +1319,30 @@ def _vector_extract_constraint_system(
     ctx: DerivationContext, op: vector.ExtractOp
 ) -> tuple[cs.ConstraintSystem, ValueSitesForVariable]:
   del ctx
+  operand = Variable(ValueSite(op, VariableType.OPERAND, 0))
   if not isinstance(op.result.type, ir.VectorType):  # scalar result
-    operand = ValueSite(op, VariableType.OPERAND, 0)
-    variable = cs.Variable(operand)
     layout = fa.WGSplatFragLayout(tuple(op.source.type.shape))
     # We only support indexing for splat layout.
     assignments: dict[cs.Variable, cs.Constant] = {
-        variable: cs.RegisterLayout(layout)
+        operand: cs.RegisterLayout(layout)
     }
-    return cs.ConstraintSystem(assignments), {variable: [operand]}
+    return cs.ConstraintSystem(assignments), {operand: [operand.key]}
 
   if op.dynamic_position:
     raise NotImplementedError("Only slicing with static indices allowed.")
-  operand = ValueSite(op, VariableType.OPERAND, 0)
-  result = ValueSite(op, VariableType.RESULT, 0)
-  variable = cs.Variable(operand)
+  result = Variable(ValueSite(op, VariableType.RESULT, 0))
   constraints = [
-      cs.Divides(variable, tuple(op.result.type.shape)),
+      cs.Equals(operand, result),
+      cs.Divides(operand, tuple(op.source.type.shape)),
+      cs.Divides(result, tuple(op.result.type.shape)),
       # TODO(allanrenucci): Remove once vectors with splat and strided layouts
       # can be sliced.
-      cs.NotOfType(variable, fa.WGSplatFragLayout),
-      cs.NotOfType(variable, fa.WGStridedFragLayout),
+      cs.NotOfType(result, fa.WGSplatFragLayout),
+      cs.NotOfType(result, fa.WGStridedFragLayout),
   ]
   return (
       cs.ConstraintSystem(constraints=constraints),
-      {variable: [operand, result]},
+      {operand: [operand.key], result: [result.key]},
   )
 
 
@@ -1355,7 +1358,7 @@ def _custom_primitive_constraint_system(
   variables: list[cs.Variable] = []
   for i, operand in enumerate(op.operands):
     if is_vector(operand):
-      v = cs.Variable(ValueSite(op, VariableType.OPERAND, i))
+      v = Variable(ValueSite(op, VariableType.OPERAND, i))
       variables.append(v)
       assignments[v] = cs.RegisterLayout(
           layouts_lib.from_layout_attr(next(in_layouts))
@@ -1372,7 +1375,7 @@ def _custom_primitive_constraint_system(
       # a conflict between the assignments.
       value_site = ValueSite(op, VariableType.OPERAND, i)
       source_var = ctx.producer_ref(value_site)
-      v = cs.Variable(value_site)
+      v = Variable(value_site)
       constraints.append(cs.Equals(lhs=source_var, rhs=v))
       variables.append(v)
       transforms = next(in_transforms)
@@ -1384,7 +1387,7 @@ def _custom_primitive_constraint_system(
   out_layouts = iter(op.out_layouts)
   for i, result in enumerate(op.results):
     if isinstance(result.type, ir.VectorType):
-      v = cs.Variable(ValueSite(op, VariableType.RESULT, i))
+      v = Variable(ValueSite(op, VariableType.RESULT, i))
       variables.append(v)
       assignments[v] = cs.RegisterLayout(
           layouts_lib.from_layout_attr(next(out_layouts))
@@ -1433,13 +1436,16 @@ def _tmem_alloc_constraint_system(
 ) -> ConstraintSystemDerivationRuleResult:
   del ctx
   result = ValueSite(op, VariableType.RESULT, 0)
-  result_var = cs.Variable(result)
+  result_var = Variable(result)
   in_smem = ValueSite(op, VariableType.OPERAND, 0)
-  in_smem_var = cs.Variable(in_smem)
+  in_smem_var = Variable(in_smem)
   assignments: dict[cs.Variable, cs.Constant] = {
       in_smem_var: cs.SMEMTiling(None)
   }
-  operands_for_variable = {result_var: [result], in_smem_var: [in_smem]}
+  operands_for_variable: ValueSitesForVariable = {
+      result_var: [result],
+      in_smem_var: [in_smem],
+  }
   return cs.ConstraintSystem(assignments=assignments), operands_for_variable
 
 
@@ -1585,7 +1591,7 @@ def _async_load_tmem_constraint_system(
   source = ValueSite(op, VariableType.OPERAND, 0)
   source_variable = ctx.producer_ref(source)
   destination = ValueSite(op, VariableType.RESULT, 0)
-  destination_variable = cs.Variable(destination)
+  destination_variable = Variable(destination)
   constraint = cs.IsTransferableTmemRegisters(
       source_variable,
       destination_variable,
@@ -1692,10 +1698,10 @@ def _slice_tmem_constraint_system(
     if (cached_variable := ctx.slice_tmem_aliases.get(alias_key)) is not None:
       result_variable = cached_variable
     else:
-      result_variable = cs.Variable(result)
+      result_variable = Variable(result)
       ctx.slice_tmem_aliases[alias_key] = result_variable
   else:
-    result_variable = cs.Variable(result)
+    result_variable = Variable(result)
   return (
       cs.ConstraintSystem(),
       {operand_variable: [operand], result_variable: [result]},
@@ -1708,7 +1714,7 @@ def _async_store_tmem_constraint_system(
     op: mgpu.AsyncStoreTmemOp,
 ) -> ConstraintSystemDerivationRuleResult:
   source = ValueSite(op, VariableType.OPERAND, 0)
-  source_variable = cs.Variable(source)
+  source_variable = Variable(source)
   destination = ValueSite(op, VariableType.OPERAND, 1)
   destination_variable = ctx.producer_ref(destination)
   constraint = cs.IsTransferableTmemRegisters(
@@ -1735,10 +1741,10 @@ def _slice_smem_constraint_system(
     if (cached_variable := ctx.slice_smem_aliases.get(alias_key)) is not None:
       result_variable = cached_variable
     else:
-      result_variable = cs.Variable(result)
+      result_variable = Variable(result)
       ctx.slice_smem_aliases[alias_key] = result_variable
   else:
-    result_variable = cs.Variable(result)
+    result_variable = Variable(result)
   return cs.ConstraintSystem(), {result_variable: [result]}
 
 
@@ -1748,8 +1754,9 @@ def _memref_subview_constraint_system(
     op: memref.SubViewOp,
 ) -> ConstraintSystemDerivationRuleResult:
   source = ValueSite(op, VariableType.OPERAND, 0)
-  dest = ValueSite(op, VariableType.RESULT, 0)
-  source_dest_var = ctx.producer_ref(source)
+  source_var = ctx.producer_ref(source)
+  result = ValueSite(op, VariableType.RESULT, 0)
+  result_var = Variable(result)
 
   if any(s != 1 for s in op.static_strides):
     raise NotImplementedError(
@@ -1782,9 +1789,12 @@ def _memref_subview_constraint_system(
         divisibility_constraint = dynamic_gcd(divisibility_constraint, offset)
       tiling_multiple.append(divisibility_constraint)
 
-  constraints = [cs.Divides(source_dest_var, tuple(tiling_multiple))]
+  constraints = [
+      cs.Divides(source_var, tuple(tiling_multiple)),
+      cs.Equals(source_var, result_var),
+  ]
   system = cs.ConstraintSystem(constraints=constraints)
-  return system, {source_dest_var: [source, dest]}
+  return system, {source_var: [source], result_var: [result]}
 
 
 @_add_constraint_system_derivation_rule(memref.CastOp)
@@ -1815,7 +1825,7 @@ def _memref_transpose_op_constraint_system(
   if not transpose:
     return cs.ConstraintSystem(), {source_var: [source, dest]}
 
-  dest_var = cs.Variable(dest)
+  dest_var = Variable(dest)
   constraints = [
       cs.Equals(cs.Transpose(source_var), dest_var),
       cs.Equals(source_var, cs.Transpose(dest_var)),
@@ -1835,8 +1845,9 @@ def _memref_expand_shape_op_equation_system(
     )
 
   source = ValueSite(op, VariableType.OPERAND, 0)
+  source_var = ctx.producer_ref(source)
   dest = ValueSite(op, VariableType.RESULT, 0)
-  var = ctx.producer_ref(source)
+  dest_var = Variable(dest)
 
   reverse_tiling_multiple = []
   for dim, idx in zip(
@@ -1849,8 +1860,14 @@ def _memref_expand_shape_op_equation_system(
       break
     reverse_tiling_multiple.append(dim)
 
-  constraints = [cs.Divides(var, tuple(reversed(reverse_tiling_multiple)))]
-  return cs.ConstraintSystem(constraints=constraints), {var: [source, dest]}
+  constraints = [
+      cs.Divides(source_var, tuple(reversed(reverse_tiling_multiple))),
+      cs.Equals(source_var, dest_var),
+  ]
+  return cs.ConstraintSystem(constraints=constraints), {
+      source_var: [source],
+      dest_var: [dest],
+  }
 
 
 # `memref.load` and `memref.store` are used to load barrier phases which are
@@ -1871,7 +1888,7 @@ def _memref_load_store_op_constraint_system(
 
   ref_op_index = 0 if isinstance(op, memref.LoadOp) else 1
   ref = ValueSite(op, VariableType.OPERAND, ref_op_index)
-  var = cs.Variable(ref)
+  var = Variable(ref)
   assignments: dict[cs.Variable, cs.Constant] = {var: cs.SMEMTiling(None)}
   return cs.ConstraintSystem(assignments=assignments), {var: [ref]}
 
@@ -1955,7 +1972,7 @@ def _vector_value_sites_and_assignments_for_async_ops(
   for i, idx in enumerate(op.indices):
     if isinstance(idx.type, ir.VectorType):
       value_site = ValueSite(op, VariableType.OPERAND, base_operand_index + i)
-      value_site_var = cs.Variable(value_site)
+      value_site_var = Variable(value_site)
       layout = cs.RegisterLayout(value=fa.TMA_GATHER_INDICES_LAYOUT)
       values_sites[value_site_var] = [value_site]
       assignments[value_site_var] = layout
@@ -2259,7 +2276,7 @@ def derive_relayout_constraints(
   for variable, value_sites in value_sites_for_variable.items():
     for value_site in value_sites:
       # We can only relayout variables that are in registers.
-      if value_site.memory_space != MemorySpace.REG:
+      if value_site.memory_space != cs.MemorySpace.REG:
         continue
 
       elt_bitwidth = utils.bitwidth(value_site.value.type.element_type)
@@ -2372,19 +2389,19 @@ def is_valid_assignment(shape: tuple[int, ...], layout: cs.Constant) -> bool:
 def check_layout_assignment(v: ValueSite, layout: cs.Constant) -> None:
   """Raises if the given layout can not be assigned to the given `ValueSite`."""
   match v.memory_space, layout:
-    case MemorySpace.REG, cs.RegisterLayout(value=reg_layout):
+    case cs.MemorySpace.REG, cs.RegisterLayout(value=reg_layout):
       if not is_valid_register_layout_assignment(v.shape, reg_layout):
         raise ValueError(
             f"Layout {reg_layout} is not compatible with register variable "
             f"{v.value}. This is a bug."
         )
-    case MemorySpace.TMEM, cs.TMEMLayout(value=tmem_layout):
+    case cs.MemorySpace.TMEM, cs.TMEMLayout(value=tmem_layout):
       if not is_valid_tmem_layout_assignment(v.shape, tmem_layout):
         raise ValueError(
             f"Layout {tmem_layout} is not compatible with TMEM variable "
             f"{v.value}. This is a bug."
         )
-    case MemorySpace.SMEM, cs.SMEMTiling(value=tiling_or_none):
+    case cs.MemorySpace.SMEM, cs.SMEMTiling(value=tiling_or_none):
       if tiling_or_none is None:
         return
       if not is_valid_smem_layout_assignment(v.shape, tiling_or_none):
@@ -2444,6 +2461,19 @@ def infer_layout(
     rule_result = rule(ctx, op)
     nonlocal global_constraint_system
     constraint_system, mapping = rule_result
+    for var, sites in mapping.items():
+      assert isinstance(var.key, ValueSite)
+      for site in sites:
+        if site.memory_space != var.memory_space:
+          raise ValueError(
+              f"Memory space mismatch between variable and {site}:"
+              f" {var.memory_space} != {site.memory_space}."
+          )
+        if site.shape != var.shape:
+          raise ValueError(
+              f"Shape mismatch between variable and {site}:"
+              f" {var.shape} != {site.shape}."
+          )
     global_constraint_system &= constraint_system
     ctx.update(mapping)
 

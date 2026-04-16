@@ -48,7 +48,7 @@ config.parse_flags_with_absl()
 class MockVariableKey:
   idx: int
   shape: tuple[int, ...]
-  memory_space: layout_inference.MemorySpace
+  memory_space: cs.MemorySpace
 
 
 def _make_ir_context():
@@ -780,16 +780,12 @@ class LayoutInferenceTest(parameterized.TestCase):
   def test_conjure_assignment_prioritizes_relayout(self):
     shape = (128, 128)
 
-    v1 = cs.Variable(
-        MockVariableKey(1, shape, layout_inference.MemorySpace.REG)
-    )
+    v1 = cs.Variable(MockVariableKey(1, shape, cs.MemorySpace.REG))
     # Use a TiledLayout so it doesn't get pushed to low priority in conjure_assignment
     layout = cs.RegisterLayout(mgpu.WGMMA_LAYOUT)
     relayout_constraint = cs.Relayout(v1, layout, 16)
 
-    v2 = cs.Variable(
-        MockVariableKey(2, shape, layout_inference.MemorySpace.REG)
-    )
+    v2 = cs.Variable(MockVariableKey(2, shape, cs.MemorySpace.REG))
     tmem_layout = tcgen05.tmem_default_layout(packing=1)
     transfer_constraint = cs.IsTransferableTmemRegisters(
         v2, cs.TMEMLayout(tmem_layout), shape, bitwidth=32
@@ -801,17 +797,17 @@ class LayoutInferenceTest(parameterized.TestCase):
     )
     self.assertEqual(next(assignments), (v1, layout))
 
-  @parameterized.parameters(*layout_inference.MemorySpace)
+  @parameterized.parameters(*cs.MemorySpace)
   def test_relayout_only_derived_for_registers(self, memory_space):
     with ir.InsertionPoint(self.module.body):
       shape = (128,)
       f32 = ir.F32Type.get()
       match memory_space:
-        case layout_inference.MemorySpace.REG:
+        case cs.MemorySpace.REG:
           ty = ir.VectorType.get(shape, f32)
-        case layout_inference.MemorySpace.TMEM:
+        case cs.MemorySpace.TMEM:
           ty = ir.MemRefType.get(shape, f32, memory_space=mgpu.utils.tmem())
-        case layout_inference.MemorySpace.SMEM:
+        case cs.MemorySpace.SMEM:
           ty = ir.MemRefType.get(shape, f32, memory_space=mgpu.utils.smem())
         case _:
           raise ValueError(f"Unsupported memory space: {memory_space}")
@@ -832,7 +828,7 @@ class LayoutInferenceTest(parameterized.TestCase):
           layout_inference.ValueSitesForVariable({r_var: [r], o_var: [o]})
       )
 
-      if memory_space == layout_inference.MemorySpace.REG:
+      if memory_space == cs.MemorySpace.REG:
         self.assertEqual(
             relayouts, [cs.Relayout(r_var, o_var, 32, strict=True)]
         )
@@ -842,7 +838,7 @@ class LayoutInferenceTest(parameterized.TestCase):
   def test_find_assignments_for_is_transferable_constraints_is_deterministic(
       self,
   ):
-    v0 = V(MockVariableKey(0, (128, 128), layout_inference.MemorySpace.REG))
+    v0 = V(MockVariableKey(0, (128, 128), cs.MemorySpace.REG))
     tmem_layout = tcgen05.tmem_default_layout(packing=1)
     constraint = cs.IsTransferableTmemRegisters(
         v0, cs.TMEMLayout(tmem_layout), shape=(128, 128), bitwidth=32
