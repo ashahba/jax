@@ -3748,7 +3748,9 @@ class ArrayPjitTest(jtu.JaxTestCase):
       return x + np_const[:8] + arr_const[:8]
 
     # all misses
-    self.assertCacheMisses(lambda: f(np_inp), cpp=1)
+    # one of the misses if for device_put(np_const)
+    expected_misses = 2 if config.use_simplified_jaxpr_constants.value else 1
+    self.assertCacheMisses(lambda: f(np_inp), cpp=expected_misses)
     # all hits
     self.assertCacheMisses(lambda: f(np_inp), cpp=0, tracing=0, lowering=0)
 
@@ -3773,7 +3775,9 @@ class ArrayPjitTest(jtu.JaxTestCase):
       return x + arr_const + np_const[:4]
 
     # all misses
-    self.assertCacheMisses(lambda: f(inp), cpp=1)
+    # one of the misses if for device_put(np_const)
+    expected_misses = 2 if config.use_simplified_jaxpr_constants.value else 1
+    self.assertCacheMisses(lambda: f(inp), cpp=expected_misses)
     # all hits
     self.assertCacheMisses(lambda: f(inp), cpp=0, tracing=0, lowering=0)
 
@@ -3793,7 +3797,9 @@ class ArrayPjitTest(jtu.JaxTestCase):
       return lax.scan(scan_body, np.zeros_like(np_inp),
                       np.ones((8,), dtype=np.float32))
 
-    self.assertCacheMisses(f, cpp=1, lowering=1)
+    # one of the misses if for device_put(np_const)
+    expected_misses = 2 if config.use_simplified_jaxpr_constants.value else 1
+    self.assertCacheMisses(f, cpp=expected_misses, lowering=expected_misses)
     self.assertCacheMisses(f, cpp=0, tracing=0, lowering=0)
     # Run the scan body directly
     self.assertCacheMisses(lambda: scan_body(np_inp, np.float32(1)),
@@ -4884,10 +4890,13 @@ class ArrayPjitTest(jtu.JaxTestCase):
     def apply(x):
       return inner(x)
 
+    # misses for init, apply and inner (only once)
+    # if we hoist constants as args, we also miss for resharding `zeros`
+    expected_cache_misses = 4 if config.use_simplified_jaxpr_constants.value else 3
     with jtu.count_jit_tracing_cache_miss() as count:
       init()
       apply(x)
-    self.assertEqual(count(), 3)  # misses for init, apply and inner (only once)
+    self.assertEqual(count(), 3)
 
   def test_wsc_aval_diff_shardings(self):
     mesh = jtu.create_mesh((1,), 'x')
