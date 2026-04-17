@@ -1040,6 +1040,11 @@ def _extract_indirect_offsets_from_indexer(
         isinstance(offsets.type, ir.MemRefType) or
         isinstance(offsets.type, ir.VectorType)
     ):  # fmt: on
+      if offsets.type.rank != 1:
+        raise NotImplementedError(
+            "Only 1D indices are supported by scatter/gather via"
+            f" `pltpu.async_copy` on SparseCore, got rank {offsets.type.rank}"
+        )
       shape = (*offsets.type.shape, *indexer.shape[offsets.type.rank :])
       if expected_shape is not None and shape != expected_shape:
         raise NotImplementedError(
