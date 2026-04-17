@@ -45,7 +45,6 @@ from jax._src.pallas.mosaic import lowering as tc_lowering
 from jax._src.pallas.mosaic import primitives as tpu_primitives
 from jax._src.pallas.mosaic import sc_core
 from jax._src.pallas.mosaic import tpu_info
-from jax._src.state import discharge as state_discharge
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic.dialects import tpu
@@ -1034,13 +1033,23 @@ def _dma_wait_lowering_rule(
 def _extract_indirect_offsets_from_indexer(
     indexer: indexing.NDIndexer, expected_shape: tuple[int, ...] | None = None
 ) -> ir.Value | None:
+  """Extracts the indirect offsets from an indexer, if it has any.
+
+  Note that it ignores any dimensions other than major. The indexer might
+  need to be split further to deal with slicing of minor dimensions.
+  """
   match indexer.indices:
     case [ir.Value() as offsets, *_] if (
         # fmt: off
         isinstance(offsets.type, ir.MemRefType) or
         isinstance(offsets.type, ir.VectorType)
     ):  # fmt: on
-      shape = (*offsets.type.shape, *indexer.shape[offsets.type.rank :])
+      if offsets.type.rank != 1:
+        raise NotImplementedError(
+            "Only 1D indices are supported by scatter/gather via"
+            f" `pltpu.async_copy` on SparseCore, got rank {offsets.type.rank}"
+        )
+      shape = (*offsets.type.shape, *indexer.get_indexer_shape()[offsets.type.rank :])
       if expected_shape is not None and shape != expected_shape:
         raise NotImplementedError(
             "The indexer shape in scatter/gather via `pltpu.async_copy` does"
@@ -1077,14 +1086,6 @@ def _extract_indirect_offsets_from_indexer(
           "Indices for scatter/gather via `pltpu.async_copy` must be in VMEM,"
           f" got {offsets_memory_space!r}"
       )
-  if not state_discharge._is_trivial_indexer(
-      indexing.NDIndexer(indexer.indices[1:], indexer.shape[1:], ())
-  ):
-    # TODO(slebedev): Consider lifting this restriction.
-    raise NotImplementedError(
-        "Only indexing along the major dimension is supported in scatter/gather"
-        " via `pltpu.async_copy`"
-    )
   return offsets
 
 
@@ -1097,12 +1098,16 @@ def _extract_indirect_offsets(
     offsets = _extract_indirect_offsets_from_indexer(indexer, expected_shape)
     if offsets is None:
       continue
+    # The slices applied to other dimensions are processed independently of
+    # indirect offsets.
+    split_indices = (indexing.Slice(0, indexer.shape[0]), *indexer.indices[1:])
+    split_indexer = indexing.NDIndexer(split_indices, indexer.shape, ())
     if i != len(transforms) - 1:
       raise NotImplementedError(
           "The indexed ref in scatter/gather via `pltpu.async_copy` cannot have"
           " any transforms following the indexer"
       )
-    return offsets, transforms[:i]
+    return offsets, [*transforms[:i], split_indexer]
 
   return None, transforms
 
