@@ -106,7 +106,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
 
     container:
-      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest # zizmor: ignore[unpinned-images]
 
     defaults:
       run:
@@ -131,7 +131,9 @@ jobs:
 
       - name: Build ${{ inputs.artifact }} wheel
         timeout-minutes: 60
-        run: ./ci/build_oneapi_artifacts.sh "${{ inputs.artifact }}"
+        env:
+          ARTIFACT: ${{ inputs.artifact }}
+        run: ./ci/build_oneapi_artifacts.sh "$ARTIFACT"
 
       - name: List generated wheels
         run: |
