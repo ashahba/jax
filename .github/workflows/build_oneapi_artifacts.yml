@@ -117,6 +117,7 @@ jobs:
       JAXCI_ONEAPI_VERSION: ${{ inputs.oneapi-version }}
       JAXCI_CLONE_MAIN_XLA: ${{ inputs.clone_main_xla }}
       JAXCI_BUILD_ARTIFACT_WITH_RBE: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
 
     steps:
       - name: Check out JAX
@@ -125,7 +126,7 @@ jobs:
           persist-credentials: false
 
       - name: Wait for connection
-        uses: google-ml-infra/actions/ci_connection@9f8d7d8d9954430d0fef4a8cce2cb4e3844c200d
+        uses: google-ml-infra/actions/ci_connection@7f5ca0c263a81ed09ea276524c1b9192f1304e3c
         with:
           halt-dispatch-input: ${{ inputs.halt-for-connection }}
 
