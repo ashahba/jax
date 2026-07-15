@@ -88,8 +88,12 @@ on:
         type: string
         default: "no"
 
-permissions:
-  contents: read
+      upload_artifacts_to_gcs:
+        description: "Should the built wheels be uploaded to GCS?"
+        type: boolean
+        default: false
+
+permissions: {}
 
 jobs:
   build-oneapi-wheel:
