@@ -24,7 +24,7 @@ _current_jaxlib_version = '0.10.2'
 # The following should be updated after each new jaxlib release.
 _latest_jaxlib_version_on_pypi = '0.10.2'
 
-_libtpu_version = '0.0.42.*'
+_libtpu_version = '0.0.44.*'
 
 def load_version_module(pkg_path):
   spec = importlib.util.spec_from_file_location(
@@ -121,6 +121,11 @@ setup(
         'rocm7-local': [
           f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
           f"jax-rocm7-plugin=={_jax_version}.*",
+        ],
+
+        'oneapi': [
+          f"jaxlib>={_current_jaxlib_version},<={_jax_version}",
+          f"jax-oneapi-plugin[with-oneapi]>={_current_jaxlib_version},<={_jax_version}",
         ],
 
         # For automatic bootstrapping distributed jobs in Kubernetes

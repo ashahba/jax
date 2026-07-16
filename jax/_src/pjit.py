@@ -51,7 +51,7 @@ from jax._src.api_util import (
     check_no_aliased_ref_args, _check_no_aliased_closed_over_refs,
     flatten_axis_resources)
 from jax._src.interpreters import partial_eval as pe
-from jax._src.partition_spec import PartitionSpec
+from jax._src.partition_spec import PartitionSpec, UnreducedKind
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
@@ -484,6 +484,7 @@ class PjitParams(NamedTuple):
 def _trace_for_jit(
     fun: Callable, ji: PjitInfo, ctx_mesh: mesh_lib.Mesh,
     dbg: core.DebugInfo, avals, args, kwargs) -> PjitParams:
+  util.test_event("infer_params_cache_miss")
   args_ft, in_tree_nones, in_tree_filtered = ft.flatten_static_argnums_argnames_and_return_various_trees(
       args, kwargs, ji.static_argnums, ji.static_argnames)
   avals_ft = args_ft.update(avals)
@@ -649,7 +650,9 @@ def _infer_params(
     return entry.pjit_params, entry.pjit_params.consts + dynargs
 
   p = _trace_for_jit(fun, ji, ctx_mesh, dbg_fn(), avals, args, kwargs)
-  if p.params['jaxpr'].is_high:
+  const_avals = _infer_input_type(fun, dbg_fn, p.consts)
+  # TODO(mattjj, yashkatariya): Remove this when Box and qdd are deleted.
+  if p.params['jaxpr'].is_high and any(a.has_qdd for a in const_avals + avals):
     return p, p.consts + dynargs
   entry.pjit_params = p
   return p, p.consts + dynargs
@@ -2320,8 +2323,7 @@ def reshard(xs, out_shardings):
     if ds is None:
       raise ValueError(
           'Reshard should only be used with out_shardings which are non-None '
-          f'and have a non-empty mesh. Got sharding {s}.'
-      )
+          f'and have a non-empty mesh. Got sharding {s}.')
     ds = ds.update(spec=ds.spec._normalized_spec_for_aval(x_aval.ndim))
     cmesh = (s.mesh if (isinstance(s, NamedSharding) and
                         isinstance(s.mesh, mesh_lib.Mesh))
@@ -2332,8 +2334,27 @@ def reshard(xs, out_shardings):
 reshard_p = core.Primitive('reshard')
 reshard_p.skip_canonicalization = True
 
+def _check_unreduced_reshard(aval, dst_sharding):
+  # dst_sharding can't be more unreduced than src_sharding in case of
+  # UnreducedKind.{max,min}.
+  if (dst_sharding.spec.unreduced and
+      dst_sharding.spec.unreduced_kind != UnreducedKind.sum and
+      dst_sharding.spec.unreduced - aval.sharding.spec.unreduced):
+      raise ValueError(
+          'out_sharding passed to `jax.reshard` cannot be more unreduced than'
+          f' the input. Got input pspec: {aval.sharding.spec},'
+          f' out pspec: {dst_sharding.spec}')
+
+  if (aval.sharding.spec.unreduced and dst_sharding.spec.unreduced and
+      aval.sharding.spec.unreduced_kind != dst_sharding.spec.unreduced_kind):
+      raise ValueError(
+          'The unreduced_kind of input and output sharding passed to'
+          ' `jax.reshard` should be the same. Got input spec:'
+          f' {aval.sharding.spec} and output spec: {dst_sharding.spec}')
+
 def _reshard_abstract_eval(aval, *, dst_sharding, concrete_mesh):
   assert isinstance(aval, core.ShapedArray)
+  _check_unreduced_reshard(aval, dst_sharding)
   if aval.sharding == dst_sharding:
     return aval
   return aval.update(sharding=dst_sharding)

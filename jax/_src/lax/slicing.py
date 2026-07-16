@@ -45,7 +45,7 @@ from jax._src.lax.utils import (_argnum_weak_type, input_dtype,
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.named_sharding import NamedSharding
-from jax._src.partition_spec import PartitionSpec as P
+from jax._src.partition_spec import PartitionSpec as P, UnreducedKind
 from jax._src.typing import Array, ArrayLike, Shape
 from jax._src.state.indexing import ds
 from jax._src.util import safe_map, safe_zip
@@ -1383,6 +1383,9 @@ def _get_sub_spec_size(mesh, sub_spec):
 def _get_sharding_for_varying_out_shape(out_shape, operand, name):
   """Returns a sharding when out_shape may not be the same as operand shape"""
   mesh = operand.sharding.mesh
+  if not out_shape or all(o == 1 for o in out_shape):
+    return NamedSharding(mesh, P())
+
   for op_sh, out_sh, op_spec in safe_zip(
       operand.shape, out_shape, operand.sharding.spec.partitions):
     if (op_sh != out_sh and op_spec is not None and
@@ -1403,7 +1406,9 @@ def _get_sharding_for_varying_out_shape(out_shape, operand, name):
   return operand.sharding
 
 def _slice_ur_rule(operand, *, start_indices, limit_indices, strides):
-  return core.getu(operand), core.getr(operand)
+  out_unreduced = core.getu(operand)
+  kind = UnreducedKind.sum if out_unreduced else None
+  return out_unreduced, core.getr(operand), kind
 
 def _slice_sharding_rule(operand, *, start_indices, limit_indices, strides):
   # TODO(yashkatariya): Once JAX supports uneven sharding at the top level,
@@ -1524,7 +1529,7 @@ def _dynamic_slice_ur_rule(operand, *starts_and_dyn_sizes, slice_sizes):
     raise NotImplementedError(
         'unreduced rule for dynamic_slice is not implemented. Please'
         ' file an issue at https://github.com/jax-ml/jax/issues')
-  return frozenset(), core.getr(operand)
+  return frozenset(), core.getr(operand), None
 
 def _dynamic_slice_dtype_rule(operand, *starts_and_dyn_sizes, slice_sizes):
   start_indices, dyn = util.split_list(starts_and_dyn_sizes, [operand.ndim])
@@ -1667,7 +1672,8 @@ def _dus_unreduced_rule(operand, update):
         " same axes. Got operand sharding"
         f" {operand.str_short(mesh_axis_types=True)} and update sharding"
         f" {update.str_short(mesh_axis_types=True)}.")
-  return core.getu(operand)
+  out_u = core.getu(operand)
+  return out_u, UnreducedKind.sum if out_u else None
 
 def _dus_reduced_rule(operand, update):
   if core.getr(operand) != core.getr(update):
@@ -1679,7 +1685,8 @@ def _dus_reduced_rule(operand, update):
   return core.getr(operand)
 
 def _dynamic_update_slice_ur_rule(operand, update, *start_indices):
-  return _dus_unreduced_rule(operand, update), _dus_reduced_rule(operand, update)
+  out_u, kind = _dus_unreduced_rule(operand, update)
+  return out_u, _dus_reduced_rule(operand, update), kind
 
 def _dynamic_update_slice_dtype_rule(operand, update, *start_indices):
   lax.check_same_dtypes("dynamic_update_slice", operand, update)
@@ -2027,8 +2034,8 @@ def _gather_spec_computation(operand, indices, dimension_numbers, slice_sizes):
   start_indices_batching_dims = dimension_numbers.start_indices_batching_dims
   output_shape_rank = len(offset_dims) + indices.ndim - 1
 
-  operand_spec = operand.sharding.spec
-  indices_spec = list(indices.sharding.spec)
+  operand_spec = operand.sharding.spec.partitions
+  indices_spec = list(indices.sharding.spec.partitions)
 
   if (all(s is None for s in operand_spec) and
       all(s is None for s in indices_spec)):
@@ -2196,13 +2203,14 @@ def _gather_transpose_fancy(out_ct, operand, indices, *, dimension_numbers,
   if type(out_ct) is ad_util.Zero or isinstance(operand, ad.NullAccum):
     return
   operand_aval, = lax_utils.ensure_shaped(operand.aval)
-  if isinstance(operand, ad.RefAccum):
-    indexer = _gather_to_ref_indexer(indices, dimension_numbers, slice_sizes,
-                                     mode, operand_aval.shape)
-    if indexer is not None:
-      # in-place add-update at the gathered indices, no dense intermediates
-      operand.inst().ref.addupdate(out_ct, indexer)
-      return
+  op_shape = operand_aval.shape
+  if (isinstance(operand, ad.RefAccum) and
+      (indexer := _gather_to_ref_indexer(
+          indices, dimension_numbers, slice_sizes, mode, op_shape)) is not None):
+    # in-place add-update at the gathered indices, no dense intermediates
+    operand.inst().ref.addupdate(out_ct, indexer)
+    return
+
   scatter_dnums = ScatterDimensionNumbers(
       update_window_dims=dimension_numbers.offset_dims,
       inserted_window_dims=dimension_numbers.collapsed_slice_dims,
@@ -2219,7 +2227,7 @@ def _gather_transpose_fancy(out_ct, operand, indices, *, dimension_numbers,
   else:
     # use out_ct's dtype, not operand_aval's: cotangents can flow in a
     # different (e.g. higher-precision) dtype than the primal
-    zeros = lax.full(operand_aval.shape, 0, typeof(out_ct).dtype,
+    zeros = lax.full(op_shape, 0, typeof(out_ct).dtype,
                      sharding=operand_aval.sharding)
     zeros = core.pvary(zeros, tuple(operand_aval.mat.varying))
     operand.accum(scatter_add(zeros, indices, out_ct, scatter_dnums,

@@ -52,6 +52,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.pallas import mosaic_gpu as _plgpu
+from jax._src.pallas.mosaic.error_handling import VerificationError
 import jax.numpy as jnp
 import numpy as np
 
@@ -4100,6 +4101,55 @@ class PallasCallTest(PallasTest, jtu.CudaArchSpecificTest):
     )
     self.assertRegex(ptx_output, re.compile(kernel_b_pattern, re.DOTALL))
 
+  def test_mlir_error_includes_mlir_error_callsites(self):
+    class MockAttr:
+      def __init__(self, loc):
+        self.location = loc
+
+      def __str__(self):
+        return str(self.location)
+
+    class MockLoc:
+      def __init__(self, location):
+        self.attr = MockAttr(location)
+
+    class MockDiagnostic:
+      def __init__(self, message, loc):
+        self.message = message
+        self.location = MockLoc(loc)
+        self.notes = []
+
+    class MockMLIRError(ir.MLIRError):
+      def __init__(self, message, diagnostics):
+        super().__init__(message)
+        self._diagnostics = diagnostics
+
+      @property
+      def error_diagnostics(self):
+        return self._diagnostics
+
+    def mock_verify_fail(self) -> bool:
+      loc_str = 'loc("kernel"("fn1"("file1.py":10:20) at "fn2"("file2.py":30:40)))'
+      raise MockMLIRError("err", [MockDiagnostic("diagnostic", loc_str)])
+
+    with mock.patch.object(ir.Operation, "verify", mock_verify_fail):
+      try:
+        @self.kernel(out_type=jax.ShapeDtypeStruct((16,), jnp.bfloat16))
+        def kernel(out):
+          del out
+        jax.jit(kernel).lower()
+        self.fail("unreachable")
+      except VerificationError as e:
+        frames = traceback.extract_tb(e.__traceback__)
+        frame_caller = frames[-2]
+        self.assertEqual(frame_caller.filename, "file2.py")
+        self.assertEqual(frame_caller.lineno, 30)
+        self.assertEqual(frame_caller.name, "fn2")
+        frame_callee = frames[-1]
+        self.assertEqual(frame_callee.filename, "file1.py")
+        self.assertEqual(frame_callee.lineno, 10)
+        self.assertEqual(frame_callee.name, "fn1")
+
 
 class PallasCallWarpPrimitiveSemanticsTest(PallasTest):
   def setUp(self):
@@ -4835,6 +4885,45 @@ class PallasCallSm90ATest(PallasSm90ATest):
     )(a, b, i)
     np.testing.assert_allclose(res, i + a @ b, rtol=2e-3)
 
+  def test_run_state_discharge_regression_test(self):
+    # This regression test voluntarily allocates an outer accumulator and a
+    # SMEM ref using `run_scoped``, and then uses them both inside of
+    # `run_state`. This used to trigger two bugs:
+    # 1. The SMEM ref would end up being unexpectedly discharged inside of
+    #    `run_state`;
+    # 2. The dereferencing of the outer accumulator would be improperly handled
+    #    in the results of `run_state`.
+    transforms = self.default_transforms(dtype=jnp.float16)
+
+    def kernel(a_ref, b_ref, o_ref, barrier_ref):
+      def outer_scope(b_smem, acc):
+        plgpu.copy_gmem_to_smem(b_ref, b_smem, barrier_ref)
+        plgpu.barrier_wait(barrier_ref)
+
+        def inner_scope(inner_acc):
+          del inner_acc
+          a_regs = plgpu.load(a_ref, layout=plgpu.Layout.WGMMA, optimized=False)
+          plgpu.wgmma(acc, a_regs, b_smem)
+        # Use an inner accumulator because `run_state` lowering expects it.
+        pl.run_state(inner_scope)(plgpu.ACC.init(
+            plgpu.layout_cast(jnp.zeros((64, 64), jnp.float32), plgpu.Layout.WGMMA)))
+        o_ref[...] = acc[...]
+      pl.run_scoped(outer_scope,
+                    plgpu.SMEM(b_ref.shape, jnp.float16, transforms=transforms),
+                    plgpu.ACC((64, 192), jnp.float32))
+
+    key1, key2 = jax.random.split(jax.random.key(42), 2)
+    a = jax.random.uniform(key1, shape=(64, 128), dtype=jnp.float16)
+    b = jax.random.uniform(key2, shape=(128, 192), dtype=jnp.float16)
+
+    res = self.kernel(
+        kernel,
+        scratch_types=[plgpu.Barrier()],
+        out_type=jax.ShapeDtypeStruct((64, 192), jnp.float32),
+    )(a, b)
+    np.testing.assert_allclose(res, a @ b, rtol=2e-3)
+
+
   def test_wgmma_registers_init_with_update(self):
     def kernel(a_ref, b_ref, i_ref, o_ref):
       def scope(acc_ref):
@@ -5352,6 +5441,65 @@ class PallasCallTCGen05Test(PallasTCGen05Test):
         jax.random.key(0), shape=(128, 128), dtype=jnp.float32)
     x_result = jax.block_until_ready(kernel(x))
     np.testing.assert_array_equal(x_result, x + 1)
+
+  @parameterized.product(
+      dtype=[jnp.float32, jnp.int32],
+      reduction=["min", "max", "absmin", "absmax"],
+  )
+  def test_load_reduce_tmem_native(self, dtype, reduction):
+    self.skip_if_wg_semantics()
+    if not (
+        jtu.is_cuda_compute_capability_at_least("10.1")
+        and not jtu.is_cuda_compute_capability_at_least("12.0")
+    ):
+      self.skipTest("Requires compute capability between 10.1 or 12.0")
+    if not jtu.is_cuda_version_at_least(13, 0):
+      self.skipTest("Requires CUDA version 13.0 or higher")
+    shape = (128, 128)
+    if "abs" in reduction and dtype == jnp.int32:
+      reduction = reduction[-3:]
+      dtype = jnp.uint32
+
+    @self.kernel(
+        out_type=(
+            jax.ShapeDtypeStruct(shape, dtype),
+            jax.ShapeDtypeStruct((shape[0],), dtype),
+        ),
+        scratch_types=[plgpu.TMEM(shape, dtype)],
+    )
+    def kernel(x_ref, y_ref, red_y_ref, tmem_ref):
+      x_val = plgpu.load(x_ref, layout=plgpu.Layout.TCGEN05, optimized=False)
+      plgpu.async_store_tmem(tmem_ref, x_val)
+      plgpu.commit_tmem()
+      loaded, reduced = plgpu.async_load_tmem(
+          tmem_ref,
+          layout=plgpu.Layout.TCGEN05_TMEM_NATIVE,
+          reduce=reduction,
+      )
+      y_ref[...] = loaded
+      red_y_ref[...] = reduced
+
+    prng = np.random.default_rng(0)
+    if dtype == jnp.int32:
+      x = prng.integers(-100000, 100000, shape).astype(dtype)
+    elif dtype == jnp.uint32:
+      x = prng.integers(0, 1000000, shape).astype(dtype)
+    else:
+      x = prng.uniform(-1, 1, shape).astype(dtype)
+    y, red_y = jax.block_until_ready(kernel(x))
+    np.testing.assert_array_equal(y, x)
+    match reduction:
+      case "min":
+        expected = np.min(x, axis=1)
+      case "max":
+        expected = np.max(x, axis=1)
+      case "absmin":
+        expected = np.min(np.abs(x), axis=1)
+      case "absmax":
+        expected = np.max(np.abs(x), axis=1)
+      case _:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    np.testing.assert_array_equal(red_y, expected)
 
   @parameterized.parameters(
       plgpu.Layout.TCGEN05_M64_COLLECTIVE(160),
@@ -7240,6 +7388,39 @@ class PipelineTest(PallasTest):
     )
 
     np.testing.assert_allclose(kernel_fn(x), x.sum(0, keepdims=True), rtol=1e-6)
+
+  def test_pipeline_oob_mode(self):
+    # This test crashes with the default OOB fill mode of ZEROS because
+    # it can't copy large 1D arrays.
+
+    dtype = jnp.int8
+    block_size = 512
+
+    def kernel(x_gmem, o_gmem):
+      def pipeline_body(_, x_smem, o_smem):
+        o_smem[...] = x_smem[...]
+
+      plgpu.emit_pipeline(
+          pipeline_body,
+          grid=(1,),
+          in_specs=[
+              plgpu.BlockSpec(
+                  (block_size,),
+                  lambda i: (i,),
+                  oob_fill_mode=plgpu.OOBFillMode.UNDEFINED,
+              )
+          ],
+          out_specs=[plgpu.BlockSpec((block_size,), lambda i: (i,))],
+          max_concurrent_steps=1,
+      )(x_gmem, o_gmem)
+
+    kernel_fn = self.kernel(
+        kernel,
+        out_type=jax.ShapeDtypeStruct((block_size,), dtype),
+    )
+
+    x = jnp.arange(block_size, dtype=dtype)
+    np.testing.assert_array_equal(kernel_fn(x), x)
 
   def test_emit_with_parallel_grid(self):
     num_steps1 = 4

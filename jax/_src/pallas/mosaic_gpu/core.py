@@ -49,6 +49,7 @@ from jax._src.state import types as state_types
 import jax.experimental.mosaic.gpu as mgpu
 from jax.experimental.mosaic.gpu import tcgen05
 from jax.experimental.mosaic.gpu import utils as mgpu_utils
+from jax.experimental.mosaic.gpu.launch_context import OOBFillMode
 import jax.numpy as jnp
 from jaxlib.mlir import ir
 
@@ -132,7 +133,7 @@ class CompilerParams:
   profile_space: int = 0
   profile_dir: str = ""
   profile_trace_scope: TraceScope = TraceScope.WARPGROUP
-  lowering_semantics: mgpu.core.LoweringSemantics = mgpu.core.LoweringSemantics.Lane
+  lowering_semantics: mgpu.core.LoweringSemantics = mgpu.core.LoweringSemantics.Warpgroup
 
   def __post_init__(self):
     if self.dimension_semantics is not None:
@@ -1411,10 +1412,13 @@ class BlockSpec(pallas_core.BlockSpec):
       return the same block from the index_map for this operand. This enables
       the pipelining helpers to use collective async copies, which can improve
       performance.
+    oob_fill_mode: Determines the behavior for out-of-bounds accesses during
+      pipelined GMEM-to-SMEM copies. Defaults to ``OOBFillMode.ZEROS``.
   """
   transforms: Sequence[state_types.Transform] = ()
   delay_release: int = 0
   collective_axes: tuple[Hashable, ...] = ()
+  oob_fill_mode: OOBFillMode = OOBFillMode.ZEROS
 
   def to_block_mapping(
       self,

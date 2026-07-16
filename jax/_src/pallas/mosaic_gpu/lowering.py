@@ -1290,7 +1290,8 @@ def lower_jaxpr_to_mosaic_gpu(
       if i + 1 < len(jaxpr.eqns):
         lookahead_eqn = jaxpr.eqns[i + 1]
         is_layout_cast = lookahead_eqn.primitive == gpu_core.layout_cast_p
-        uses_eqn_output = lookahead_eqn.invars == eqn.outvars
+        # We provide the hint for the first output only.
+        uses_eqn_output = lookahead_eqn.invars == eqn.outvars[:1]
         if is_layout_cast and uses_eqn_output:
           out_layout_hint = lookahead_eqn.params["new_layout"].to_mgpu()
       rule_ctx = LoweringRuleContext(
@@ -3114,7 +3115,12 @@ def _copysign_lowering_rule(ctx: LoweringRuleContext, x1, x2):
 
 @register_lowering_rule(lax.sign_p, mgpu.LoweringSemantics.Lane)
 @register_lowering_rule(lax.sign_p, mgpu.LoweringSemantics.Warpgroup)
+@register_lowering_rule(lax.sign_p, *gpu_core.LANExWARP_SEMANTICS)
+@register_lowering_rule(lax.sign_p, *gpu_core.WGxWARP_SEMANTICS)
 def _sign_lowering_rule(ctx: LoweringRuleContext, x):
+  if (ctx.module_ctx.primitive_semantics == gpu_core.PrimitiveSemantics.Warp and
+      ctx.avals_in[0].shape):
+    raise ValueError("Warp-level sign is not supported for non-scalar inputs.")
   def sign(x):
     if jnp.issubdtype(x.dtype, jnp.floating):
       ones = lax.full(x.shape, 1.0, dtype=x.dtype)
@@ -3292,7 +3298,9 @@ def _reduce_sum_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes,
 
 
 @register_lowering_rule(lax.reduce_max_p, mgpu.LoweringSemantics.Warpgroup)
-def _reduce_max_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
+def _reduce_max_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes,
+                                 out_sharding):
+  del out_sharding
   [x_aval] = ctx.avals_in
   if jnp.issubdtype(x_aval.dtype, jnp.floating):
     kind = vector_dialect.CombiningKind.MAXIMUMF
@@ -3309,7 +3317,9 @@ def _reduce_max_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
 
 
 @register_lowering_rule(lax.reduce_min_p, mgpu.LoweringSemantics.Warpgroup)
-def _reduce_min_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes):
+def _reduce_min_lowering_rule_wg(ctx: LoweringRuleContext, x, *, axes,
+                                 out_sharding):
+  del out_sharding
   [x_aval] = ctx.avals_in
   if jnp.issubdtype(x_aval.dtype, jnp.floating):
     kind = vector_dialect.CombiningKind.MINIMUMF
@@ -3720,6 +3730,13 @@ def _run_state_lowering_rule(
 
   should_discharge = []
   new_input_vals = []
+  # `should_deref_acc` is used under lane lowering semantics, to figure out
+  # whether we need to return a `WGMMAAccumulator` or a `FragmentedArray` when
+  # encountering a `WGMMAAbstractAccumulatorRef` as input.
+  #
+  # We can't tell the difference under warpgroup lowering semantics, but we do
+  # not need to since we always return a `vector` anyway.
+  should_deref_acc = []
   for arg, v, out_aval in zip(args, jaxpr.invars, ctx.avals_out):
     aval = v.aval
     if isinstance(aval, gpu_core.WGMMAAbstractAccumulatorRef):
@@ -3728,7 +3745,12 @@ def _run_state_lowering_rule(
         nvvm_dialect.wgmma_fence_aligned()
         new_input_vals.append(arg)
       else:
-        new_input_vals.append(mgpu.WGMMAAccumulator.from_registers(arg))
+        if isinstance(arg, mgpu.WGMMAAccumulator):
+          should_deref_acc.append(False)
+          new_input_vals.append(arg)  # pyrefly: ignore[bad-argument-type]
+        else:
+          should_deref_acc.append(True)
+          new_input_vals.append(mgpu.WGMMAAccumulator.from_registers(arg))
       should_discharge.append(True)
       assert isinstance(out_aval, jax_core.ShapedArray)
     else:
@@ -3749,9 +3771,15 @@ def _run_state_lowering_rule(
       ctx.module_ctx, ctx.launch_ctx, discharged_jaxpr, new_input_vals, ()  # pyrefly: ignore[bad-argument-type]
   )
   # Await the accumulators and extract their final values.
+  #
+  # Note: there may be accumulators that we have closed over and that should not
+  # technically not be dereferenced. That's not a big deal: since `run_state` is
+  # always used with at least one accumulator though, we need to await here
+  # anyway.
+  deref_acc = iter(should_deref_acc)
   nvvm_dialect.wgmma_wait_group_sync_aligned(0)
   outs = [
-      out.value if isinstance(out, mgpu.WGMMAAccumulator) else out
+      out.value if isinstance(out, mgpu.WGMMAAccumulator) and next(deref_acc) else out
       for out in outs
   ]
   # Blend the discharge results with refs we closed over. I don't fully
