@@ -116,7 +116,7 @@ jobs:
       JAXCI_HERMETIC_PYTHON_VERSION: ${{ inputs.python }}
       JAXCI_ONEAPI_VERSION: ${{ inputs.oneapi-version }}
       JAXCI_CLONE_MAIN_XLA: ${{ inputs.clone_main_xla }}
-      JAXCI_BUILD_ARTIFACT_WITH_RBE: "1"
+      JAXCI_BUILD_ARTIFACT_WITH_RBE: "0"
 
     steps:
       - name: Check out JAX
