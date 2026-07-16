@@ -106,7 +106,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
 
     container:
-      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest  # zizmor: ignore[unpinned-image]
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest  # zizmor: ignore[unpinned-images]
 
     defaults:
       run:
