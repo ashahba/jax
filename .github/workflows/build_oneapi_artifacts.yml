@@ -88,7 +88,6 @@ jobs:
     name: >-
       Build ${{ inputs.artifact }},
       Python ${{ inputs.python }},
-      oneAPI ${{ inputs.oneapi-version }},
       clone main XLA=${{ inputs.clone_main_xla }}
 
     runs-on: ${{ inputs.runner }}
@@ -102,7 +101,6 @@ jobs:
 
     env:
       JAXCI_HERMETIC_PYTHON_VERSION: ${{ inputs.python }}
-      JAXCI_ONEAPI_VERSION: ${{ inputs.oneapi-version }}
       JAXCI_CLONE_MAIN_XLA: ${{ inputs.clone_main_xla }}
       JAXCI_BUILD_ARTIFACT_WITH_RBE: "0"
 
