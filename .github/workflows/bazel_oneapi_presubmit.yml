@@ -41,6 +41,5 @@ jobs:
       runner: ${{ matrix.runner }}
       artifact: ${{ matrix.artifact }}
       python: ${{ matrix.python }}
-      oneapi-version: ${{ matrix.oneapi-version }}
       clone_main_xla: 0
       upload_artifacts_to_gcs: false
