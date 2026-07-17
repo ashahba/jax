@@ -35,7 +35,6 @@ jobs:
         runner: ["linux-x64-battlemage-256-1gpu-intel"]
         artifact: ["jax-oneapi-plugin", "jax-oneapi-pjrt"]
         python: ["3.14"]
-        oneapi-version: ["2025.1"]
 
     name: "Build oneAPI wheels"
     with:
