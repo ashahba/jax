@@ -88,7 +88,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
 
     container:
-      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest
+      image: us-docker.pkg.dev/ml-oss-artifacts-published/ml-public-container/ml-build:latest  # zizmor: ignore[unpinned-images]
 
     defaults:
       run:
@@ -118,3 +118,7 @@ jobs:
         run: |
           echo "Generated wheel artifacts:"
           ls -lh dist/*.whl
+          
+      - name: Clean up root-owned __pycache__ from actions
+        if: always()
+        run: find "$GITHUB_ACTION_PATH/../.." -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
